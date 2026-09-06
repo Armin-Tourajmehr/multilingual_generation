@@ -1,0 +1,157 @@
+# ============================================================
+# Multilingual Representation Analysis
+# Main reproducible experiment configuration.
+# ============================================================
+
+project:
+  name: multilingual-representation-analysis
+  seed: 42
+
+# ------------------------------------------------------------
+# Languages
+# ------------------------------------------------------------
+languages:
+  - ar
+  - bn
+  - en
+  - es
+  - eu
+  - fa
+  - fr
+  - hi
+  - id
+  - ml
+  - mr
+  - ne
+  - pt
+  - sw
+  - ta
+  - te
+  - ur
+  - vi
+
+language_names:
+  ar: Arabic
+  bn: Bengali
+  en: English
+  es: Spanish
+  eu: Basque
+  fa: Persian
+  fr: French
+  hi: Hindi
+  id: Indonesian
+  ml: Malayalam
+  mr: Marathi
+  ne: Nepali
+  pt: Portuguese
+  sw: Swahili
+  ta: Tamil
+  te: Telugu
+  ur: Urdu
+  vi: Vietnamese
+
+# ------------------------------------------------------------
+# Aya data
+# ------------------------------------------------------------
+# Every available sample is used. To prevent train/analysis
+# leakage, all samples of each language are deterministically
+# shuffled and split into train and analysis partitions.
+data:
+  root_dir: data/aya_language_datasets
+  input_column: inputs
+  target_column: targets
+  language_column: final_language_code
+  sample_id_column: sample_id
+
+  train_fraction: 0.80
+  analysis_fraction: 0.20
+  sampling: random       # random = deterministic shuffle; first = preserve CSV order
+
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
+# Enabled models are executed sequentially, one model at a time.
+# This keeps GPU/CPU memory bounded and makes each model's outputs
+# independent and reproducible.
+models:
+  mgpt:
+    enabled: true
+    model_name: ai-forever/mGPT
+    model_type: causal_lm
+    use_chat_template: false
+    torch_dtype: auto
+
+  bloom:
+    enabled: true
+    model_name: bigscience/bloom-560m
+    model_type: causal_lm
+    use_chat_template: false
+    torch_dtype: auto
+
+  qwen3_8b:
+    enabled: true
+    model_name: Qwen/Qwen3-8B
+    model_type: causal_lm
+    use_chat_template: true
+    chat_template_kwargs:
+      enable_thinking: false
+    torch_dtype: auto
+
+  gemma3_4b:
+    enabled: true
+    model_name: google/gemma-3-4b-it
+    model_type: causal_lm
+    use_chat_template: true
+    chat_template_kwargs: {}
+    torch_dtype: auto
+
+# ------------------------------------------------------------
+# Generation
+# ------------------------------------------------------------
+generation:
+  max_new_tokens: 30
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+
+# ------------------------------------------------------------
+# Representation / GMM
+# ------------------------------------------------------------
+representation:
+  pca_dim: 50
+  pca_variance: null        # null = use pca_dim; otherwise set e.g. 0.98
+  pca_solver: incremental
+  pca_batch_size: 2048
+  gmm_components: 1
+  gmm_covariance_type: diag
+  gmm_reg_covar: 1.0e-6
+  equal_language_priors: true
+
+# ------------------------------------------------------------
+# Runtime
+# ------------------------------------------------------------
+runtime:
+  device: auto              # auto, cuda, cpu
+  device_map: auto          # auto or null
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  max_input_tokens: null
+  save_hidden_states: false
+
+# ------------------------------------------------------------
+# Outputs
+# ------------------------------------------------------------
+outputs:
+  root_dir: outputs
+  model_dir: trained_language_models
+  result_dir: analysis_results
+  overwrite: false
+
+# ------------------------------------------------------------
+# Pipeline stages
+# ------------------------------------------------------------
+stages:
+  prepare_data_check: true
+  train_language_models: true
+  analyze: true
+  create_summary: true

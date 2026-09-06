@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Hugging Face / model caches
+.cache/
+.huggingface/
+transformers_cache/
+
+# Local data/model outputs
+outputs/
+data/aya_language_datasets/*.csv
+*.pkl
+*.pt
+*.bin
+*.safetensors
+
+# Logs / temp
+*.log
+.DS_Store
+Thumbs.db
+
+!outputs/README.md
+!data/aya_language_datasets/README.md

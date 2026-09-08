@@ -1,121 +1,175 @@
 # Multilingual Representation Analysis — Kaggle Main Experiment
 
-This repository is a **full main-experiment Kaggle version**. It is not a smoke test and it does not use a reduced sample count.
+This repository contains the **full main experiment**. There is no smoke-test configuration.
 
-## Experimental design
+## Research design
 
 ```text
-Wikipedia multilingual text
+CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+        │
+        │  18 languages × up to 3,000 passages/language
         ↓
-BLOOM / mGPT hidden states
+BLOOM / mGPT forward pass (no generation)
         ↓
-PCA fit (700 components, per layer)
+Hidden states at every model layer
         ↓
-1-component diagonal Gaussian/GMM per language
+Layer-wise Incremental PCA (700 components)
         ↓
-All Aya samples
+One diagonal Gaussian per language and layer
+        │
+        │  frozen reference space
         ↓
-generation → generated-token hidden states
+All Aya samples (100% — no 80/20 split)
         ↓
-PCA transform
+Generation (up to 64 new tokens)
         ↓
-GMM posterior
+Generated-token hidden states
+        ↓
+PCA.transform()
+        ↓
+Language posterior under Wikipedia-fitted Gaussians
+        ↓
+Token-level + sample/sentence-level outputs
 ```
 
-The reference/fitting corpus is `CohereLabs/wikipedia-2023-11-embed-multilingual-v3`. It is streamed directly from Hugging Face. The dataset has very large language subsets, so the experiment uses an equal deterministic cap of **3,000 Wikipedia passages per language** by default. The dataset card reports close to 250M passages overall. citeturn790182search0
+Wikipedia is the **reference corpus** used only to fit the representation space. Aya is the **evaluation corpus**. Wikipedia is never used as an instruction-generation dataset.
 
-Aya is **not split into train/test or 80/20**. Every available sample in each of the 18 languages is passed through the evaluation stage.
-
-## 18 languages
+The experiment uses the following 18 languages:
 
 ```text
 ar bn en es eu fa fr hi id ml mr ne pt sw ta te ur vi
 ```
 
+## Why the Wikipedia cap is 3,000 per language
+
+The Wikipedia dataset has very large language subsets. The experiment therefore uses an equal deterministic cap of 3,000 passages for every configured language. This gives at most 54,000 Wikipedia passages per model and prevents high-resource languages from dominating the fitted reference space.
+
+Wikipedia is streamed from Hugging Face, so the full dataset is not downloaded locally.
+
 ## Models
 
-The current experiment runs only:
+The current experiment contains:
 
-- mGPT — `ai-forever/mGPT`
-- BLOOM — `bigscience/bloom-560m`
+- `ai-forever/mGPT`
+- `bigscience/bloom-560m`
 
-They run sequentially, one model at a time. Qwen is kept as a disabled placeholder in the config for future experiments with other Qwen sizes. Gemma is removed.
+They run **sequentially**, one model at a time. Each model uses a single CUDA device (or CPU when CUDA is unavailable).
 
-## Kaggle setup
+Qwen is retained as a disabled future configuration slot. Gemma is not included.
 
-### 1. Create a Kaggle Notebook
+## Runtime configuration
 
-Use a GPU accelerator. Turn **Internet** on because the notebook streams Hugging Face datasets and downloads model weights.
+The main experiment uses one GPU/device at a time. Wikipedia is processed in **8-passage batches per language**. A 3,000-passage language therefore runs as six pipeline chunks. This is intentionally separate from the Aya evaluation batch size, which remains smaller to control generation memory.
 
-### 2. Clone
-
-```python
-!git clone https://github.com/<USERNAME>/<REPOSITORY>.git
-%cd <REPOSITORY>
+```yaml
+runtime:
+  device: auto
+  device_map: null
+  mixed_precision: fp16
+  wikipedia_batch_size: 32
+  evaluation_batch_size: 8
 ```
 
-### 3. Install
+The implementation also avoids allocating the CausalLM vocabulary logits during Wikipedia representation extraction; it calls the underlying transformer body and requests hidden states only. This substantially reduces unnecessary GPU memory use.
 
-```python
-!pip install -q -r requirements.txt
+## Installation
+
+Python 3.10+ is recommended. A CUDA-capable GPU is strongly recommended.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 4. Prepare Aya
+## Prepare Aya
 
-```python
-!python scripts/prepare_aya.py
+Aya CSV files are intentionally not committed to GitHub. Generate them with:
+
+```bash
+python scripts/prepare_aya.py
 ```
 
-This creates the complete 18-language Aya CSV set under:
+This creates the complete 18-language Aya dataset under:
 
 ```text
 data/aya_language_datasets/
 ```
 
-The CSV files are intentionally not committed to GitHub. They are generated in the Kaggle working directory from the Aya dataset.
+The generated CSV files contain the full available samples for the configured language set.
 
-### 5. Run the main experiment
+## Run the main experiment
 
-```python
-!python scripts/run_experiment.py --config configs/config.yaml
+```bash
+python scripts/run_experiment.py --config configs/config.yaml
 ```
 
-Do not change the sample counts to 1, 10, or another smoke-test value. The supplied configuration is the main experiment.
-
-## What happens during the run?
-
-For each model:
-
-1. Wikipedia is streamed, 3,000 passages per language.
-2. Hidden states are extracted with a normal forward pass.
-3. PCA is fitted layer-by-layer using 700 components.
-4. A one-component diagonal Gaussian is fitted for every language at every layer in PCA space.
-5. The entire Aya corpus is processed.
-6. Each Aya instruction is used to generate up to 64 tokens.
-7. Hidden states of the generated tokens are extracted.
-8. Aya representations are transformed by the frozen Wikipedia PCA.
-9. Language posterior probabilities are computed from the frozen Wikipedia-fitted Gaussian models.
-10. Results are written incrementally to Parquet files grouped by language.
+The script runs each enabled model sequentially. No model is generated from Wikipedia; Wikipedia is used for fitting PCA/Gaussian reference models. Every available Aya sample is then evaluated.
 
 ## Outputs
 
-Look under:
-
 ```text
 outputs/
+├── manifests/
+│   ├── aya_input_summary.csv
+│   ├── wikipedia_fit_samples.parquet
+│   └── wikipedia_language_counts.csv
+├── trained_language_models/
+│   ├── mgpt/
+│   │   ├── layer_000.pkl ...
+│   │   └── wikipedia_gaussian_fit_counts.csv
+│   └── bloom/
+│       ├── layer_000.pkl ...
+│       └── wikipedia_gaussian_fit_counts.csv
+├── analysis_results/
+│   ├── mgpt/
+│   │   ├── generated_outputs/<language>.parquet
+│   │   ├── token_posteriors/<language>.parquet
+│   │   ├── sentence_level_posteriors/<language>.parquet
+│   │   └── analysis_counts.csv
+│   └── bloom/
+│       └── ...
+└── run_config.json
 ```
 
-In particular:
+`token_posteriors/<language>.parquet` contains one row per **generated token × layer** and includes `token`, `token_id`, `token_position`, `sample_id`, `input_language`, `layer`, and `P_<language>` posterior columns.
 
-```text
-outputs/analysis_results/mgpt/token_posteriors/
-outputs/analysis_results/mgpt/sentence_level_posteriors/
-outputs/analysis_results/bloom/token_posteriors/
-outputs/analysis_results/bloom/sentence_level_posteriors/
+`sentence_level_posteriors/<language>.parquet` contains one row per **Aya sample × layer**. The posterior columns are the mean posterior over that sample's generated tokens for the corresponding layer.
+
+Parquet is used because the complete experiment can produce very large token-level output files.
+
+## Reproducibility
+
+The project seed is `42`. Wikipedia uses deterministic shuffled streaming with an equal per-language cap. Aya sample preparation is deterministic. The effective configuration is saved to `outputs/run_config.json`.
+
+For a long-lived frozen dataset version, set `wikipedia.revision` in `configs/config.yaml` to a fixed Hugging Face revision rather than `null`.
+
+## Kaggle
+
+On Kaggle, enable **Internet** and **GPU**. The experiment uses one GPU (`cuda:0`) at a time; a second GPU is not required. GPU use is required by the main configuration.
+
+```python
+!git clone https://github.com/<USERNAME>/<REPOSITORY>.git
+%cd <REPOSITORY>
+!pip install -q -r requirements.txt
+!python scripts/prepare_aya.py
+!python scripts/run_experiment.py --config configs/config.yaml
 ```
 
-Token-level data has posterior columns such as `P_en`, `P_fa`, etc. Sentence/sample-level data contains the mean posterior over the generated tokens for each layer.
+Check GPU visibility before the full run:
 
-## Important
+```python
+import torch
+print("CUDA:", torch.cuda.is_available())
+print("GPU count:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i))
+```
 
-This is the full experiment. It can create a large amount of output data because token-level results contain every generated token at every hidden-state layer for every Aya sample. Parquet is used to make this feasible to store and analyze.
+The run performs a CUDA preflight and then places the model on `cuda:0`. It fails fast if CUDA is unavailable. The selected GPU and model parameter device are printed before inference.
+
+The Wikipedia corpus is streamed directly from Hugging Face and does not need to be added as a Kaggle Dataset.
+
+## Important computational note
+
+This is the full research run. The reference phase uses up to 3,000 Wikipedia passages per language, PCA has 700 components, and the Aya stage processes every available sample. Token-level results are written incrementally to Parquet so they do not need to remain in RAM.

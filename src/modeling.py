@@ -1,10 +1,11 @@
-
 from __future__ import annotations
 
 import gc
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -21,22 +22,59 @@ class LoadedModel:
 def _dtype(value: str, device: torch.device):
     if value in (None, "auto"):
         return "auto"
-    mapping = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    mapping = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
     if value not in mapping:
         raise ValueError(f"Unsupported torch_dtype: {value}")
     return mapping[value]
 
 
+def _resolve_device(runtime: dict[str, Any]) -> torch.device:
+    requested = runtime.get("device", "auto")
+    require_gpu = bool(runtime.get("require_gpu", False))
+    if require_gpu and not torch.cuda.is_available():
+        raise RuntimeError(
+            "GPU is required for this experiment, but CUDA is unavailable. "
+            "Enable a CUDA GPU in Kaggle or run on a CUDA-enabled machine."
+        )
+    if requested == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if requested == "cuda" or requested == "gpu":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but CUDA is unavailable.")
+        return torch.device("cuda:0")
+    if isinstance(requested, int) or (isinstance(requested, str) and requested.isdigit()):
+        if not torch.cuda.is_available():
+            raise RuntimeError("A CUDA device was requested, but CUDA is unavailable.")
+        index = int(requested)
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(f"cuda:{index} is unavailable. Found {torch.cuda.device_count()} device(s).")
+        return torch.device(f"cuda:{index}")
+    return torch.device(str(requested))
+
+
+def _precision_context(device: torch.device, runtime: dict[str, Any]):
+    mode = str(runtime.get("mixed_precision", "fp16")).lower()
+    if device.type != "cuda" or mode in {"none", "off", "false"}:
+        return nullcontext()
+    if mode == "fp16":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    if mode == "bf16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    raise ValueError(f"Unsupported mixed_precision mode: {mode}")
+
+
 def load_model(model_key: str, spec: dict[str, Any], runtime: dict[str, Any]) -> LoadedModel:
-    device = torch.device("cuda" if runtime.get("device", "auto") == "auto" and torch.cuda.is_available() else runtime.get("device", "cpu"))
-    if device.type == "cuda":
-        device_map = runtime.get("device_map", "auto")
-    else:
-        device_map = None
-    tokenizer = AutoTokenizer.from_pretrained(spec["model_name"], trust_remote_code=runtime.get("trust_remote_code", False))
+    device = _resolve_device(runtime)
+    tokenizer = AutoTokenizer.from_pretrained(
+        spec["model_name"],
+        trust_remote_code=runtime.get("trust_remote_code", False),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Left padding is important for batched generation with decoder-only LMs.
     tokenizer.padding_side = "left"
 
     kwargs = {
@@ -48,34 +86,54 @@ def load_model(model_key: str, spec: dict[str, Any], runtime: dict[str, Any]) ->
         kwargs["dtype"] = dtype
     else:
         kwargs["dtype"] = "auto"
-    if device_map is not None:
-        kwargs["device_map"] = device_map
 
     model = AutoModelForCausalLM.from_pretrained(spec["model_name"], **kwargs)
-    if device_map is None:
-        model.to(device)
+    model.to(device)
     model.eval()
+
+    if device.type == "cuda":
+        print(f"[{model_key}] CUDA available: True")
+        print(f"[{model_key}] GPU: {torch.cuda.get_device_name(device.index or 0)}")
+        print(f"[{model_key}] GPU memory: {torch.cuda.get_device_properties(device.index or 0).total_memory / (1024**3):.1f} GiB")
+        model_device = next(model.parameters()).device
+        if model_device.type != "cuda":
+            raise RuntimeError(f"Model parameters are on {model_device}, expected CUDA.")
+    else:
+        if runtime.get("require_gpu", False):
+            raise RuntimeError("GPU was required but the loaded model is on CPU.")
+        print(f"[{model_key}] Using one inference device: {device}")
+
+    print(f"[{model_key}] Model parameters device: {next(model.parameters()).device}")
     return LoadedModel(model_key, spec, tokenizer, model, device)
 
 
-def _format_inputs(loaded: LoadedModel, prompts: list[str], runtime: dict[str, Any]) -> tuple[list[str], bool]:
+def _base_model(model):
+    """Return the transformer body to avoid allocating CausalLM logits."""
+    return getattr(model, "base_model", model)
+
+
+def _format_inputs(loaded: LoadedModel, prompts: list[str], runtime: dict[str, Any]) -> list[str]:
     if not loaded.spec.get("use_chat_template", False):
-        return prompts, False
-    rendered = []
-    for prompt in prompts:
-        rendered.append(
-            loaded.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False,
-                add_generation_prompt=True,
-                **(loaded.spec.get("chat_template_kwargs") or {}),
-            )
+        return prompts
+    return [
+        loaded.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            **(loaded.spec.get("chat_template_kwargs") or {}),
         )
-    return rendered, True
+        for prompt in prompts
+    ]
 
 
-def generate_batch(loaded: LoadedModel, prompts: list[str], generation: dict[str, Any], runtime: dict[str, Any]):
-    rendered, _ = _format_inputs(loaded, prompts, runtime)
+def _generate_on_device(
+    loaded: LoadedModel,
+    prompts: list[str],
+    generation: dict[str, Any],
+    runtime: dict[str, Any],
+):
+    device = loaded.device
+    rendered = _format_inputs(loaded, prompts, runtime)
     tok = loaded.tokenizer(
         rendered,
         return_tensors="pt",
@@ -83,9 +141,10 @@ def generate_batch(loaded: LoadedModel, prompts: list[str], generation: dict[str
         truncation=True,
         max_length=runtime.get("max_input_tokens") or None,
     )
-    tok = {k: v.to(loaded.device) for k, v in tok.items()}
-    input_width = tok["input_ids"].shape[1]
-    with torch.no_grad():
+    tok = {k: v.to(device, non_blocking=True) for k, v in tok.items()}
+    input_width = int(tok["input_ids"].shape[1])
+
+    with torch.inference_mode(), _precision_context(device, runtime):
         generated = loaded.model.generate(
             **tok,
             max_new_tokens=int(generation["max_new_tokens"]),
@@ -93,40 +152,56 @@ def generate_batch(loaded: LoadedModel, prompts: list[str], generation: dict[str
             temperature=float(generation["temperature"]) if generation.get("do_sample", True) else None,
             top_p=float(generation["top_p"]) if generation.get("do_sample", True) else None,
             pad_token_id=loaded.tokenizer.pad_token_id,
+            use_cache=True,
         )
-    # With left padding, every sequence in the batch has the same padded prompt width.
-    # Generated tokens therefore start at input_width for every sample.
-    generated_token_ids = []
+
     eos_ids = set()
     eos = loaded.tokenizer.eos_token_id
     if eos is not None:
         eos_ids.add(int(eos))
-    pad = loaded.tokenizer.pad_token_id
-    if pad is not None and pad != eos:
-        # A distinct pad token can safely be excluded if generation returned one.
-        pass
+    generated_token_ids = []
     for seq in generated:
-        ids = seq[int(input_width):].tolist()
+        ids = seq[input_width:].tolist()
         if eos_ids:
-            try:
-                end = next(i for i, token_id in enumerate(ids) if int(token_id) in eos_ids)
-                ids = ids[: end + 1]
-            except StopIteration:
-                pass
+            for pos, token_id in enumerate(ids):
+                if int(token_id) in eos_ids:
+                    ids = ids[:pos + 1]
+                    break
         generated_token_ids.append(ids)
     texts = [loaded.tokenizer.decode(ids, skip_special_tokens=True) for ids in generated_token_ids]
 
-    # Forward the complete generated sequences to obtain hidden states for the generated tokens.
-    with torch.no_grad():
-        full_out = loaded.model(generated, output_hidden_states=True, return_dict=True)
+    # Important memory optimization: use the transformer body rather than the
+    # CausalLM wrapper, so no [batch, sequence, vocabulary] logits tensor is built.
+    body = _base_model(loaded.model)
+    with torch.inference_mode(), _precision_context(device, runtime):
+        full_out = body(
+            input_ids=generated,
+            attention_mask=tok.get("attention_mask"),
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+
     hidden_states = full_out.hidden_states
-    per_sample_hidden = []
-    for i, ids in enumerate(generated_token_ids):
-        per_sample_hidden.append([h[i, int(input_width): int(input_width) + len(ids), :].detach().float().cpu().numpy() for h in hidden_states])
+    per_sample_hidden = [
+        [
+            h[i, input_width: input_width + len(ids), :].detach().float().cpu().numpy()
+            for h in hidden_states
+        ]
+        for i, ids in enumerate(generated_token_ids)
+    ]
+    del full_out, hidden_states, generated, tok
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return generated_token_ids, texts, per_sample_hidden
 
 
-def forward_text_batch(loaded: LoadedModel, texts: list[str], max_tokens: int):
+def generate_batch(loaded: LoadedModel, prompts: list[str], generation: dict[str, Any], runtime: dict[str, Any]):
+    return _generate_on_device(loaded, prompts, generation, runtime)
+
+
+def _forward_on_device(loaded: LoadedModel, texts: list[str], max_tokens: int):
+    device = loaded.device
     tok = loaded.tokenizer(
         texts,
         return_tensors="pt",
@@ -134,15 +209,23 @@ def forward_text_batch(loaded: LoadedModel, texts: list[str], max_tokens: int):
         truncation=True,
         max_length=max_tokens,
     )
-    tok = {k: v.to(loaded.device) for k, v in tok.items()}
-    with torch.no_grad():
-        out = loaded.model(**tok, output_hidden_states=True, return_dict=True)
+    tok = {k: v.to(device, non_blocking=True) for k, v in tok.items()}
+    body = _base_model(loaded.model)
+    with torch.inference_mode(), _precision_context(device, {}):
+        out = body(
+            **tok,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
     mask = tok["attention_mask"].detach().cpu().numpy().astype(bool)
-    hidden_states = out.hidden_states
-    result = []
-    for layer_hidden in hidden_states:
-        result.append(layer_hidden.detach().float().cpu().numpy())
-    return result, mask
+    hidden_states = [h.detach().cpu().numpy() for h in out.hidden_states]
+    del out, tok
+    return hidden_states, mask
+
+
+def forward_text_batch(loaded: LoadedModel, texts: list[str], max_tokens: int):
+    return _forward_on_device(loaded, texts, max_tokens)
 
 
 def release_model(loaded: LoadedModel) -> None:

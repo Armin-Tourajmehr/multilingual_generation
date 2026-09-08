@@ -126,7 +126,6 @@ def _collect_wikipedia_reference(cfg: dict[str, Any], loaded: LoadedModel, outpu
                 else:
                     pending[layer].append(X)
             del hidden, mask
-            gc.collect()
 
     # Flush any remaining data, provided it is large enough for PCA.
     for layer in range(n_layers):
@@ -162,7 +161,6 @@ def _collect_wikipedia_reference(cfg: dict[str, Any], loaded: LoadedModel, outpu
                 total[key] += Z.sum(axis=0)
                 total_sq[key] += np.square(Z).sum(axis=0)
             del hidden, mask
-            gc.collect()
 
     model_dir = output_root / cfg["outputs"]["model_dir"] / loaded.name
     model_dir.mkdir(parents=True, exist_ok=True)

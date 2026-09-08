@@ -24,6 +24,8 @@ def test_runtime_configuration():
     cfg = load_config(ROOT / "configs" / "config.yaml")
     runtime = cfg["runtime"]
     assert runtime["device_map"] is None
-    assert runtime["wikipedia_batch_size"] == 500
-    assert runtime["evaluation_batch_size"] == 128
+    assert runtime["wikipedia_batch_size"] == 32
+    assert runtime["evaluation_batch_size"] == 8
+    assert runtime["device"] == "cuda"
+    assert runtime["require_gpu"] is True
     assert runtime["mixed_precision"] == "fp16"

@@ -1,15 +1,12 @@
 # ============================================================
-# Multilingual Representation Analysis
-# Main reproducible experiment configuration.
+# MAIN EXPERIMENT CONFIGURATION
+# Wikipedia -> PCA fit -> GMM fit -> Aya full evaluation
 # ============================================================
 
 project:
-  name: multilingual-representation-analysis
+  name: multilingual-representation-analysis-main
   seed: 42
 
-# ------------------------------------------------------------
-# Languages
-# ------------------------------------------------------------
 languages:
   - ar
   - bn
@@ -51,28 +48,38 @@ language_names:
   vi: Vietnamese
 
 # ------------------------------------------------------------
-# Aya data
+# Aya evaluation data
 # ------------------------------------------------------------
-# Every available sample is used. To prevent train/analysis
-# leakage, all samples of each language are deterministically
-# shuffled and split into train and analysis partitions.
+# IMPORTANT: No train/analysis split. Every available Aya sample
+# is evaluated after the PCA/Gaussian reference space is fitted
+# on Wikipedia.
 data:
   root_dir: data/aya_language_datasets
   input_column: inputs
   target_column: targets
-  language_column: final_language_code
   sample_id_column: sample_id
 
-  train_fraction: 0.80
-  analysis_fraction: 0.20
-  sampling: random       # random = deterministic shuffle; first = preserve CSV order
+# ------------------------------------------------------------
+# Wikipedia reference data for PCA/Gaussian fitting
+# ------------------------------------------------------------
+# The dataset is streamed directly from Hugging Face.
+# It contains many millions of passages in some languages, so the
+# experiment uses an equal deterministic cap per language.
+wikipedia:
+  dataset_name: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+  split: train
+  revision: null
+  text_column: text
+  max_samples_per_language: 3000
+  max_tokens_per_document: 128
+  shuffle_buffer_size: 10000
 
 # ------------------------------------------------------------
 # Models
 # ------------------------------------------------------------
-# Enabled models are executed sequentially, one model at a time.
-# This keeps GPU/CPU memory bounded and makes each model's outputs
-# independent and reproducible.
+# Models run sequentially. Only mGPT and BLOOM are enabled now.
+# Qwen is intentionally left as a future slot so a different Qwen
+# size can be selected later without redesigning the pipeline.
 models:
   mgpt:
     enabled: true
@@ -88,8 +95,8 @@ models:
     use_chat_template: false
     torch_dtype: auto
 
-  qwen3_8b:
-    enabled: true
+  qwen:
+    enabled: false
     model_name: Qwen/Qwen3-8B
     model_type: causal_lm
     use_chat_template: true
@@ -97,16 +104,8 @@ models:
       enable_thinking: false
     torch_dtype: auto
 
-  gemma3_4b:
-    enabled: true
-    model_name: google/gemma-3-4b-it
-    model_type: causal_lm
-    use_chat_template: true
-    chat_template_kwargs: {}
-    torch_dtype: auto
-
 # ------------------------------------------------------------
-# Generation
+# Aya generation
 # ------------------------------------------------------------
 generation:
   max_new_tokens: 30
@@ -115,13 +114,12 @@ generation:
   top_p: 0.9
 
 # ------------------------------------------------------------
-# Representation / GMM
+# Representation
 # ------------------------------------------------------------
 representation:
-  pca_dim: 50
-  pca_variance: null        # null = use pca_dim; otherwise set e.g. 0.98
+  pca_dim: 700
   pca_solver: incremental
-  pca_batch_size: 2048
+  pca_batch_size: 1024
   gmm_components: 1
   gmm_covariance_type: diag
   gmm_reg_covar: 1.0e-6
@@ -131,12 +129,13 @@ representation:
 # Runtime
 # ------------------------------------------------------------
 runtime:
-  device: auto              # auto, cuda, cpu
-  device_map: auto          # auto or null
+  device: auto
+  device_map: auto
   low_cpu_mem_usage: true
   trust_remote_code: false
   max_input_tokens: null
-  save_hidden_states: false
+  wikipedia_batch_size: 8
+  evaluation_batch_size: 8
 
 # ------------------------------------------------------------
 # Outputs
@@ -145,13 +144,3 @@ outputs:
   root_dir: outputs
   model_dir: trained_language_models
   result_dir: analysis_results
-  overwrite: false
-
-# ------------------------------------------------------------
-# Pipeline stages
-# ------------------------------------------------------------
-stages:
-  prepare_data_check: true
-  train_language_models: true
-  analyze: true
-  create_summary: true

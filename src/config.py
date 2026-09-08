@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,73 +14,68 @@ class ConfigError(ValueError):
 def load_config(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
+        raise FileNotFoundError(path)
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    if not isinstance(cfg, dict):
-        raise ConfigError("Configuration must be a YAML mapping.")
     validate_config(cfg)
     return cfg
 
 
 def validate_config(cfg: dict[str, Any]) -> None:
-    required = [
-        "project", "languages", "language_names", "data", "models",
-        "generation", "representation", "runtime", "outputs",
-    ]
-    missing = [key for key in required if key not in cfg]
+    required = ["project", "languages", "language_names", "data", "wikipedia", "models", "generation", "representation", "runtime", "outputs"]
+    missing = [k for k in required if k not in cfg]
     if missing:
-        raise ConfigError(f"Missing configuration sections: {missing}")
+        raise ConfigError(f"Missing config sections: {missing}")
 
-    languages = cfg["languages"]
-    if not languages:
-        raise ConfigError("At least one language must be configured.")
-    if len(languages) != len(set(languages)):
-        raise ConfigError("Duplicate language codes found in config.")
+    langs = cfg["languages"]
+    if len(langs) != len(set(langs)):
+        raise ConfigError("Duplicate languages in config.")
+    if set(langs) != set(cfg["language_names"]):
+        raise ConfigError("languages and language_names must contain the same codes.")
 
-    unknown_names = [lang for lang in languages if lang not in cfg["language_names"]]
-    if unknown_names:
-        raise ConfigError(f"Missing language names for: {unknown_names}")
+    data = cfg["data"]
+    if data.get("input_column") != "inputs":
+        raise ConfigError("Aya input_column must be 'inputs'.")
+    if not data.get("root_dir"):
+        raise ConfigError("data.root_dir is required.")
 
-    enabled = [name for name, spec in cfg["models"].items() if spec.get("enabled", False)]
+    wiki = cfg["wikipedia"]
+    if not wiki.get("dataset_name"):
+        raise ConfigError("wikipedia.dataset_name is required.")
+    max_samples = wiki.get("max_samples_per_language")
+    if not isinstance(max_samples, int) or max_samples <= 0:
+        raise ConfigError("wikipedia.max_samples_per_language must be a positive integer.")
+    max_tokens = wiki.get("max_tokens_per_document")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        raise ConfigError("wikipedia.max_tokens_per_document must be a positive integer.")
+
+    enabled = [k for k, v in cfg["models"].items() if v.get("enabled", False)]
     if not enabled:
         raise ConfigError("At least one model must be enabled.")
-
-    train_fraction = cfg["data"].get("train_fraction")
-    analysis_fraction = cfg["data"].get("analysis_fraction")
-    if train_fraction is None or analysis_fraction is None:
-        raise ConfigError("data.train_fraction and data.analysis_fraction are required.")
-    if not (0 < train_fraction < 1) or not (0 < analysis_fraction < 1):
-        raise ConfigError("Train and analysis fractions must both be in (0, 1).")
-    if abs((train_fraction + analysis_fraction) - 1.0) > 1e-8:
-        raise ConfigError("data.train_fraction + data.analysis_fraction must equal 1.0.")
-
-    if cfg["data"].get("sampling", "random") not in {"random", "first"}:
-        raise ConfigError("data.sampling must be 'random' or 'first'.")
-
-    pca_dim = cfg["representation"].get("pca_dim")
-    pca_variance = cfg["representation"].get("pca_variance")
-    if pca_dim is None and pca_variance is None:
-        raise ConfigError("Set either representation.pca_dim or representation.pca_variance.")
-    if pca_dim is not None and pca_dim <= 0:
-        raise ConfigError("representation.pca_dim must be positive.")
-    if pca_variance is not None and not (0 < pca_variance <= 1):
-        raise ConfigError("representation.pca_variance must be in (0, 1].")
+    if any(k not in {"mgpt", "bloom", "qwen"} for k in enabled):
+        raise ConfigError(f"Unsupported enabled model(s): {enabled}")
+    if cfg["models"].get("gemma3_4b") is not None:
+        raise ConfigError("Gemma is intentionally removed from this repository.")
+    if cfg["models"].get("mgpt", {}).get("enabled") is not True or cfg["models"].get("bloom", {}).get("enabled") is not True:
+        raise ConfigError("The current main configuration must enable both mGPT and BLOOM.")
 
     rep = cfg["representation"]
-    if rep.get("pca_solver") == "incremental" and pca_variance is not None:
-        raise ConfigError("Streaming IncrementalPCA requires representation.pca_variance=null.")
-    if rep.get("pca_solver") == "incremental" and rep.get("gmm_components", 1) != 1:
-        raise ConfigError("The scalable streaming path currently requires gmm_components=1.")
-    if rep.get("pca_solver") == "incremental" and rep.get("gmm_covariance_type", "diag") != "diag":
-        raise ConfigError("The scalable streaming path requires gmm_covariance_type='diag'.")
-    if rep.get("pca_batch_size", 1) < max(2, int(pca_dim or 2)):
-        raise ConfigError("representation.pca_batch_size must be at least pca_dim for incremental PCA.")
+    if rep.get("pca_dim") != 700:
+        raise ConfigError("representation.pca_dim must be 700 for the main experiment.")
+    if rep.get("pca_solver") != "incremental":
+        raise ConfigError("Main experiment uses IncrementalPCA for memory-safe fitting.")
+    if rep.get("gmm_components") != 1 or rep.get("gmm_covariance_type") != "diag":
+        raise ConfigError("Scalable main experiment requires one diagonal Gaussian component per language/layer.")
+    if rep.get("pca_batch_size", 0) < rep["pca_dim"]:
+        raise ConfigError("representation.pca_batch_size must be >= pca_dim.")
+
+    gen = cfg["generation"]
+    if not gen.get("max_new_tokens", 0) > 0:
+        raise ConfigError("generation.max_new_tokens must be positive.")
+
+    if cfg["runtime"].get("evaluation_batch_size", 0) <= 0:
+        raise ConfigError("runtime.evaluation_batch_size must be positive.")
 
 
-def enabled_models(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {
-        name: spec
-        for name, spec in cfg["models"].items()
-        if spec.get("enabled", False)
-    }
+def enabled_models(cfg: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return [(k, v) for k, v in cfg["models"].items() if v.get("enabled", False)]

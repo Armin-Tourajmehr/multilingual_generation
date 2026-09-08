@@ -1,13 +1,3 @@
-# Prepared Aya language datasets
+# Aya input data
 
-This directory is intentionally kept empty in Git except for this README.
-
-Run:
-
-```bash
-python scripts/prepare_aya.py
-```
-
-to generate the 18 language CSV files used by `configs/config.yaml`.
-
-Generated files are ignored by Git via `.gitignore`.
+Run `python scripts/prepare_aya.py` to create the 18 language CSV files. The CSV files are intentionally ignored by Git.

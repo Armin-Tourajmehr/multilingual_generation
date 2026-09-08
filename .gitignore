@@ -15,18 +15,19 @@ env/
 .huggingface/
 transformers_cache/
 
-# Local data/model outputs
-outputs/
+# Local data and experiment artifacts
 data/aya_language_datasets/*.csv
+outputs/
 *.pkl
 *.pt
 *.bin
 *.safetensors
-
-# Logs / temp
+*.parquet
+*.jsonl
 *.log
 .DS_Store
 Thumbs.db
 
-!outputs/README.md
+# Keep documentation placeholders
 !data/aya_language_datasets/README.md
+!outputs/README.md

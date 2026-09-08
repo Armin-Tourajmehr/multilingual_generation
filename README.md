@@ -91,7 +91,7 @@ For each model:
 3. PCA is fitted layer-by-layer using 700 components.
 4. A one-component diagonal Gaussian is fitted for every language at every layer in PCA space.
 5. The entire Aya corpus is processed.
-6. Each Aya instruction is used to generate up to 30 tokens.
+6. Each Aya instruction is used to generate up to 64 tokens.
 7. Hidden states of the generated tokens are extracted.
 8. Aya representations are transformed by the frozen Wikipedia PCA.
 9. Language posterior probabilities are computed from the frozen Wikipedia-fitted Gaussian models.

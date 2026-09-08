@@ -73,11 +73,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if not gen.get("max_new_tokens", 0) > 0:
         raise ConfigError("generation.max_new_tokens must be positive.")
 
-    runtime = cfg["runtime"]
-    if runtime.get("evaluation_batch_size", 0) <= 0 or runtime.get("wikipedia_batch_size", 0) <= 0:
-        raise ConfigError("runtime batch sizes must be positive.")
-    if str(runtime.get("mixed_precision", "fp16")).lower() not in {"fp16", "bf16", "none", "off", "false"}:
-        raise ConfigError("runtime.mixed_precision must be fp16, bf16, or disabled.")
+    if cfg["runtime"].get("evaluation_batch_size", 0) <= 0:
+        raise ConfigError("runtime.evaluation_batch_size must be positive.")
 
 
 def enabled_models(cfg: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:

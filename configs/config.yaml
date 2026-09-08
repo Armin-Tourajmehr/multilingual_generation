@@ -50,9 +50,9 @@ language_names:
 # ------------------------------------------------------------
 # Aya evaluation data
 # ------------------------------------------------------------
-# All available Aya samples are evaluated. There is no train/test
-# split because PCA and Gaussian reference models are fitted only
-# on the independent Wikipedia corpus below.
+# IMPORTANT: No train/analysis split. Every available Aya sample
+# is evaluated after the PCA/Gaussian reference space is fitted
+# on Wikipedia.
 data:
   root_dir: data/aya_language_datasets
   input_column: inputs
@@ -62,8 +62,9 @@ data:
 # ------------------------------------------------------------
 # Wikipedia reference data for PCA/Gaussian fitting
 # ------------------------------------------------------------
-# Equal deterministic cap prevents high-resource languages from
-# dominating the shared representation reference space.
+# The dataset is streamed directly from Hugging Face.
+# It contains many millions of passages in some languages, so the
+# experiment uses an equal deterministic cap per language.
 wikipedia:
   dataset_name: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
   split: train
@@ -76,9 +77,9 @@ wikipedia:
 # ------------------------------------------------------------
 # Models
 # ------------------------------------------------------------
-# Enabled models run sequentially. Current main experiment:
-# mGPT + BLOOM. Qwen is reserved for future experiments and is
-# disabled by default so different Qwen sizes can be tested later.
+# Models run sequentially. Only mGPT and BLOOM are enabled now.
+# Qwen is intentionally left as a future slot so a different Qwen
+# size can be selected later without redesigning the pipeline.
 models:
   mgpt:
     enabled: true
@@ -118,7 +119,7 @@ generation:
 representation:
   pca_dim: 700
   pca_solver: incremental
-  pca_batch_size: 4096
+  pca_batch_size: 1024
   gmm_components: 1
   gmm_covariance_type: diag
   gmm_reg_covar: 1.0e-6
@@ -129,15 +130,12 @@ representation:
 # ------------------------------------------------------------
 runtime:
   device: auto
-  device_map: null
+  device_map: auto
   low_cpu_mem_usage: true
   trust_remote_code: false
-  mixed_precision: fp16
   max_input_tokens: null
-  # Number of Wikipedia passages handled per pipeline batch.
-  # This is a data chunk; the model processes it on a single device.
-  wikipedia_batch_size: 500
-  evaluation_batch_size: 128
+  wikipedia_batch_size: 8
+  evaluation_batch_size: 8
 
 # ------------------------------------------------------------
 # Outputs

@@ -79,15 +79,22 @@ def load_model(model_key: str, spec: dict[str, Any], runtime: dict[str, Any]) ->
     kwargs["dtype"] = dtype
 
     model = AutoModelForCausalLM.from_pretrained(spec["model_name"], **kwargs)
+    # Explicit single-GPU placement. No device_map/offload is used.
     model.to(device)
     model.eval()
 
     print(f"[{model_key}] CUDA available: {torch.cuda.is_available()}")
     print(f"[{model_key}] GPU: {torch.cuda.get_device_name(device.index or 0)}")
-    print(f"[{model_key}] GPU memory: {torch.cuda.get_device_properties(device.index or 0).total_memory / (1024**3):.1f} GiB")
+    props = torch.cuda.get_device_properties(device.index or 0)
+    print(f"[{model_key}] GPU memory: {props.total_memory / (1024**3):.1f} GiB")
     model_device = next(model.parameters()).device
     if model_device.type != "cuda":
         raise RuntimeError(f"Model parameters are on {model_device}, expected CUDA.")
+
+    param_dtypes = sorted({str(p.dtype) for p in model.parameters()})
+    print(f"[{model_key}] Parameter dtype(s): {param_dtypes}")
+    if spec.get("torch_dtype") == "float16" and any(p.dtype != torch.float16 for p in model.parameters()):
+        raise RuntimeError(f"[{model_key}] Expected FP16 model parameters but found {param_dtypes}.")
     print(f"[{model_key}] Model parameters device: {model_device}")
     return LoadedModel(model_key, spec, tokenizer, model, device)
 
@@ -118,8 +125,6 @@ def _tokenize(loaded: LoadedModel, texts: list[str], runtime: dict[str, Any], ma
         truncation=True,
         max_length=max_length,
     )
-    # Only tokenization data moves to CPU; all neural representations and
-    # statistical calculations stay on CUDA.
     return {k: v.to(loaded.device, non_blocking=True) for k, v in tok.items()}
 
 
@@ -134,10 +139,10 @@ def _forward_on_device(loaded: LoadedModel, texts: list[str], max_tokens: int | 
             return_dict=True,
             use_cache=False,
         )
-    # Keep hidden states on CUDA in the model/autocast dtype. Downstream
-    # PCA/GMM kernels cast only the current working tensor to float32.
     hidden_states = list(out.hidden_states)
     mask = tok["attention_mask"].bool()
+    # Explicitly release lightweight wrapper objects before returning.
+    del out, tok
     return hidden_states, mask
 
 
@@ -152,11 +157,17 @@ def _generate_on_device(
     generation: dict[str, Any],
     runtime: dict[str, Any],
 ):
+    if len(prompts) != 1:
+        raise ValueError("Kaggle-safe generation requires generation_batch_size=1.")
+
     rendered = _format_inputs(loaded, prompts)
-    tok = _tokenize(loaded, rendered, runtime, runtime.get("max_input_tokens") or None)
+    max_input_tokens = runtime.get("max_input_tokens") or None
+    tok = _tokenize(loaded, rendered, runtime, max_input_tokens)
     input_width = int(tok["input_ids"].shape[1])
     input_mask = tok["attention_mask"].bool()
 
+    # Generation is the highest peak-memory operation in the pipeline.
+    # Keeping the batch at 1 and model weights in FP16 makes mGPT viable on a T4.
     with _precision_context(loaded.device, runtime):
         generated = loaded.model.generate(
             **tok,
@@ -168,8 +179,6 @@ def _generate_on_device(
             use_cache=True,
         )
 
-    # Metadata is the only small CUDA->CPU transfer: token ids are needed by
-    # the tokenizer/Parquet writer. Hidden states never leave the GPU here.
     generated_token_ids = generated[:, input_width:].detach().cpu().tolist()
     eos = loaded.tokenizer.eos_token_id
     if eos is not None:
@@ -181,10 +190,11 @@ def _generate_on_device(
                     break
     texts = loaded.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
 
-    # The original implementation passed the input-only attention mask to a
-    # full input+generation sequence. Build the correct full mask explicitly.
+    # We need the generated sequence for the representation forward pass, but
+    # generation-time input tensors and tokenization wrappers can be released.
     full_attention = torch.ones_like(generated, dtype=torch.long, device=loaded.device)
     full_attention[:, :input_width] = input_mask.long()
+    del tok, input_mask
 
     body = _base_model(loaded.model)
     with _precision_context(loaded.device, runtime):
@@ -197,7 +207,9 @@ def _generate_on_device(
         )
 
     hidden_states = list(full_out.hidden_states)
-    return generated_token_ids, texts, hidden_states, input_mask, input_width
+    # Do not keep additional references to the large wrapper/mask tensor.
+    del full_out, full_attention, generated
+    return generated_token_ids, texts, hidden_states, input_width
 
 
 def generate_batch(loaded: LoadedModel, prompts: list[str], generation: dict[str, Any], runtime: dict[str, Any]):

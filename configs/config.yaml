@@ -84,14 +84,14 @@ models:
     model_name: ai-forever/mGPT
     model_type: causal_lm
     use_chat_template: false
-    torch_dtype: auto
+    torch_dtype: float16
 
   bloom:
     enabled: true
     model_name: bigscience/bloom-560m
     model_type: causal_lm
     use_chat_template: false
-    torch_dtype: auto
+    torch_dtype: float16
 
   qwen:
     enabled: false
@@ -132,7 +132,10 @@ runtime:
   low_cpu_mem_usage: true
   trust_remote_code: false
   mixed_precision: fp16
-  max_input_tokens: null
+  # Truncate long Aya inputs before the model forward/generation to keep a single T4 safe.
+  # This still processes 100% of Aya sample rows; only overlong prompts are truncated.
+  max_input_tokens: 512
+  generation_batch_size: 1
   # GPU batch sizes. All representation/statistical tensor math is CUDA-only.
   wikipedia_batch_size: 8
   evaluation_batch_size: 8

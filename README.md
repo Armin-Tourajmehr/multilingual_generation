@@ -1,57 +1,181 @@
 # Multilingual Representation Analysis — Kaggle Main Experiment
 
-This repository is the GPU-only main experiment for the multilingual representation analysis.
+GPU-first implementation of the multilingual representation experiment across 18 languages with mGPT and BLOOM.
 
-## Research design
+## Experimental flow
 
 ```text
-Wikipedia reference corpus (18 languages × up to 3,000 documents/language)
-        ↓
-model forward pass (GPU)
-        ↓
-all token hidden states (GPU)
-        ↓
+Wikipedia reference data
+    ↓
+model hidden states on GPU
+    ↓
 GPU covariance accumulation
-        ↓
-GPU eigendecomposition → PCA (700 components)
-        ↓
-save PCA data to the configured PCA path
-        │
-        ├────────────────────────────────────────────┐
-        ↓                                            │
-Aya, entire file for each language                   │
-        ↓                                            │
-model forward pass (GPU)                             │
-        ↓                                            │
-PCA.transform (GPU)                                  │
-        ↓                                            │
-fit one diagonal / one-component GMM per language   │
-        ↓                                            │
-save Aya-fitted GMMs                                 │
-        │                                            │
-        └────────────────────────────────────────────┘
-                         ↓
-                Aya generation + analysis
-                         ↓
-             generated hidden states (GPU)
-                         ↓
-                    PCA (GPU)
-                         ↓
-                Aya-fitted GMM posterior (GPU)
-                         ↓
-              token + sentence outputs
+    ↓
+GPU eigendecomposition
+    ↓
+PCA (700 components)
+    ↓
+save/reuse PCA data
+    ↓
+complete Aya file for each language
+    ↓
+model hidden states on GPU
+    ↓
+PCA transform on GPU
+    ↓
+one diagonal, one-component GMM per language
+    ↓
+save/reuse Aya-fitted GMMs
+    ↓
+complete Aya analysis set
+    ↓
+generation (GPU, batch size 1)
+    ↓
+full-sequence hidden states on GPU
+    ↓
+one PCA transform + posterior calculation per layer/batch
+    ↓
+token + sentence-level outputs
 ```
 
-### Important methodological change
+Wikipedia is used **only** to fit the shared PCA representation. For every configured language, the GMM is trained on **100% of the available Aya sample rows** for that language. There is no Aya train/test split and no Aya sampling cap.
 
-The Gaussian/GMM reference models are **not** fitted on Wikipedia anymore.
+The configured one-component diagonal GMM is implemented with streaming sufficient statistics on CUDA. This is mathematically equivalent to a one-component diagonal Gaussian and avoids a CPU-side scikit-learn fitting step.
 
-Wikipedia is used only to fit the shared layer-wise PCA representation.
-For every configured language, the GMM is fitted on **100% of the available Aya samples for that language**, with no train/test split and no sampling cap.
+## GPU and memory design
 
-Because the configured experiment uses `gmm_components: 1` and `gmm_covariance_type: diag`, the implementation uses streaming sufficient statistics for an exactly equivalent one-component diagonal Gaussian. This avoids a CPU-side scikit-learn GMM and keeps the fitted statistics on CUDA.
+The repository is designed for a 14–16 GiB single-GPU environment such as a Kaggle T4.
 
-## PCA data path
+The main model weights are loaded explicitly in FP16. mGPT/BLOOM run sequentially on `cuda:0`; no CPU offload or multi-GPU device map is used.
+
+The memory-sensitive settings are deliberate:
+
+```yaml
+runtime:
+  wikipedia_batch_size: 8
+  evaluation_batch_size: 8
+  generation_batch_size: 1
+  max_input_tokens: 512
+```
+
+`evaluation_batch_size=8` is used for the representation/GMM pass. Generation uses a separate batch size of 1 because autoregressive generation has a much higher peak memory requirement.
+
+`max_input_tokens=512` does **not** remove Aya samples. Every Aya row is still processed. It only truncates unusually long input prompts before the model forward/generation so a single T4 remains safe.
+
+The CUDA allocator is configured with expandable segments to reduce fragmentation during the long run.
+
+### What stays on GPU
+
+All large tensor operations remain on CUDA:
+
+- transformer forward passes
+- hidden-state tensors
+- PCA covariance accumulation
+- PCA eigendecomposition
+- PCA transforms
+- GMM sufficient-statistics accumulation
+- GMM posterior calculations
+
+Large hidden-state tensors are never converted to NumPy or copied to CPU.
+
+### What necessarily uses CPU
+
+The operating system and Python runtime still handle ordinary I/O and text work:
+
+- CSV/Parquet reading and writing
+- tokenization and text decoding
+- output metadata
+- small token-ID/posterior records required for serialization
+
+These are not used for the numerical PCA/GMM/model computation.
+
+## Avoiding redundant computation
+
+The PCA stage performs one streaming Wikipedia pass per model. It accumulates the exact global covariance statistics directly on GPU and then computes the PCA once.
+
+The Aya stage has two passes by design:
+
+1. **Pass 1:** process the complete Aya input set and fit the final per-language GMMs.
+2. **Pass 2:** process the complete Aya input set again for generation and posterior analysis.
+
+During analysis, each layer/batch performs one PCA transform and one posterior computation. The resulting posterior matrix is reused to produce both token-level and sentence-level outputs.
+
+## Models and languages
+
+Enabled models:
+
+- `ai-forever/mGPT`
+- `bigscience/bloom-560m`
+
+Configured languages:
+
+```text
+ar bn en es eu fa fr hi id ml mr ne pt sw ta te ur vi
+```
+
+Models run sequentially so GPU memory is released between models.
+
+## Repository layout
+
+```text
+configs/config.yaml
+scripts/
+    prepare_aya.py
+    run_experiment.py
+src/
+    config.py
+    data.py
+    gmm.py
+    modeling.py
+    pca_gpu.py
+    pipeline.py
+tests/
+    test_smoke.py
+```
+
+Aya CSV files are kept outside the repository's source tree history and are expected under:
+
+```text
+data/aya_language_datasets/
+```
+
+## Installation
+
+### Local CUDA environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+A CUDA-capable PyTorch installation is required.
+
+### Kaggle
+
+Create a Kaggle notebook with **GPU** and **Internet** enabled. Then:
+
+```python
+!git clone https://github.com/<USERNAME>/<REPOSITORY>.git
+%cd <REPOSITORY>
+!pip install -q -r requirements.txt
+```
+
+Prepare the complete Aya language files:
+
+```python
+!python scripts/prepare_aya.py
+```
+
+Run the experiment:
+
+```python
+!python scripts/run_experiment.py --config configs/config.yaml
+```
+
+The program performs a CUDA preflight before loading any model and exits immediately when a GPU is unavailable.
+
+## Reusing PCA data
 
 The default PCA root is:
 
@@ -59,7 +183,7 @@ The default PCA root is:
 outputs/pca_data/
 ```
 
-For each model, layer files are saved as:
+A completed model directory contains:
 
 ```text
 outputs/pca_data/<model>/layer_000.pt
@@ -68,7 +192,7 @@ outputs/pca_data/<model>/layer_001.pt
 outputs/pca_data/<model>/metadata.json
 ```
 
-You can also provide an explicit PCA path at runtime:
+Provide another location when PCA has already been generated:
 
 ```bash
 python scripts/run_experiment.py \
@@ -76,18 +200,11 @@ python scripts/run_experiment.py \
   --pca-path /kaggle/working/my_pca_data
 ```
 
-When a complete PCA directory already exists, it is reused automatically. Refit with:
+Use `--force-refit-pca` only when an intentional PCA rebuild is required.
 
-```bash
-python scripts/run_experiment.py \
-  --config configs/config.yaml \
-  --pca-path /kaggle/working/my_pca_data \
-  --force-refit-pca
-```
+## Aya GMM outputs
 
-## Aya GMM data
-
-The GMM output is stored separately from PCA:
+GMMs are stored separately:
 
 ```text
 outputs/aya_gmms/<model>/layer_000.pt
@@ -98,151 +215,37 @@ outputs/aya_gmms/<model>/aya_gmm_sample_counts.csv
 outputs/aya_gmms/<model>/metadata.json
 ```
 
-Each `layer_*.pt` contains the independent diagonal Gaussian parameters for all 18 languages at that layer. PCA is **not duplicated inside these GMM files**.
+`aya_gmm_sample_counts.csv` is a coverage audit. The run fails when the number of processed Aya sample rows does not exactly match the validated input count for any language.
 
-`aya_gmm_fit_counts.csv` records the number of Aya token vectors used for every language/layer. `aya_gmm_sample_counts.csv` records expected versus processed Aya sample rows; the run fails if those counts differ.
-
-## GPU / CPU design
-
-The main experiment is CUDA-only and fails immediately when CUDA is unavailable.
-
-All representation/statistical tensor operations are performed on the GPU:
-
-- transformer forward passes
-- hidden-state extraction
-- PCA mean/covariance accumulation
-- PCA eigendecomposition
-- PCA transforms
-- Aya GMM sufficient-statistics accumulation
-- GMM posterior calculations
-
-The previous `hidden -> .cpu().numpy()` path was removed.
-
-CPU is still necessarily used for ordinary non-tensor I/O and metadata handling, including tokenizer text processing, CSV/Parquet writing, and converting the small posterior/ID results needed by the output files. Raw hidden states are never copied to CPU.
-
-`torch.cuda.empty_cache()` is not called inside the batch loops because repeated cache flushing can add synchronization overhead.
-
-## Avoiding redundant computation
-
-The PCA stage now uses a single streaming Wikipedia pass. Instead of running a second pass to fit a Gaussian reference model, the code directly accumulates PCA covariance statistics on GPU and saves the PCA once.
-
-The Aya stage has two passes because the final GMM must be fitted on **all** Aya data before its posterior is used for output analysis:
-
-1. Aya pass 1: fit the final GMMs on all Aya input tokens.
-2. Aya pass 2: generate outputs, run one hidden-state forward pass, then perform one PCA transform + one posterior calculation per layer/batch.
-
-Inside the analysis pass, token-level and sentence-level posteriors reuse the same layer/batch PCA and GMM result; the old code's per-token PCA calls followed by a second whole-sequence PCA call are gone.
-
-## Models
-
-Current main experiment:
-
-- `ai-forever/mGPT`
-- `bigscience/bloom-560m`
-
-They run sequentially on `cuda:0`.
-
-Qwen is retained as a disabled configuration slot for future experiments.
-Gemma is intentionally not included.
-
-## Languages
+## Analysis outputs
 
 ```text
-ar bn en es eu fa fr hi id ml mr ne pt sw ta te ur vi
+outputs/analysis_results/<model>/
+    generated_outputs/<language>.parquet
+    token_posteriors/<language>.parquet
+    sentence_level_posteriors/<language>.parquet
+    analysis_counts.csv
 ```
 
-## Wikipedia reference data
+`token_posteriors` contains generated-token × layer posterior records.
 
-The configured reference corpus is:
+`sentence_level_posteriors` contains one row per Aya sample and layer, with posterior probabilities averaged across generated tokens for that sample.
+
+## Other run metadata
 
 ```text
-CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+outputs/manifests/aya_input_summary.csv
+outputs/run_config.json
 ```
 
-An equal deterministic cap of 3,000 documents per language is used. The dataset is streamed directly from Hugging Face.
+The effective configuration, including the resolved PCA path, is written to `run_config.json`.
 
-Wikipedia is **not** used as Aya/GMM training data.
+## Validation
 
-## Installation
+Run the lightweight tests before a full experiment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pytest -q
 ```
 
-Python 3.10+ is recommended. A CUDA-capable PyTorch build is required for the main experiment.
-
-## Prepare Aya
-
-Aya CSV files are intentionally not committed to GitHub. Prepare the complete configured dataset with:
-
-```bash
-python scripts/prepare_aya.py
-```
-
-This creates:
-
-```text
-data/aya_language_datasets/<language>.csv
-```
-
-## Run on Kaggle
-
-Enable **Internet** and **GPU** in Kaggle.
-
-```python
-!git clone https://github.com/<USERNAME>/<REPOSITORY>.git
-%cd <REPOSITORY>
-!pip install -q -r requirements.txt
-!python scripts/prepare_aya.py
-!python scripts/run_experiment.py --config configs/config.yaml
-```
-
-Check the accelerator before the full run:
-
-```python
-import torch
-print("CUDA:", torch.cuda.is_available())
-print("GPU count:", torch.cuda.device_count())
-for i in range(torch.cuda.device_count()):
-    print(i, torch.cuda.get_device_name(i))
-```
-
-The program then fails fast unless CUDA is available and uses `cuda:0`.
-
-## Outputs
-
-```text
-outputs/
-├── manifests/
-│   └── aya_input_summary.csv
-├── pca_data/
-│   └── <model>/
-│       ├── layer_000.pt ...
-│       ├── metadata.json
-│       └── wikipedia_document_counts.csv
-├── aya_gmms/
-│   └── <model>/
-│       ├── layer_000.pt ...
-│       ├── metadata.json
-│       ├── aya_gmm_fit_counts.csv
-│       └── aya_gmm_sample_counts.csv
-├── analysis_results/
-│   └── <model>/
-│       ├── generated_outputs/<language>.parquet
-│       ├── token_posteriors/<language>.parquet
-│       ├── sentence_level_posteriors/<language>.parquet
-│       └── analysis_counts.csv
-└── run_config.json
-```
-
-`token_posteriors/<language>.parquet` contains generated-token × layer posterior records.
-
-`sentence_level_posteriors/<language>.parquet` contains one Aya sample × layer row, with posterior probabilities averaged over that sample's generated tokens.
-
-## Reproducibility
-
-The project seed is `42`. Wikipedia uses deterministic shuffled streaming with an equal per-language cap. Aya files are processed in their entirety for GMM fitting and analysis.
-
-The effective PCA path and full configuration are written to `outputs/run_config.json`.
+These tests validate the main configuration, the 18-language setup, GPU-only numerical interfaces, and the Kaggle-safe generation settings.

@@ -32,6 +32,10 @@ def test_runtime_configuration():
     assert runtime["device"] == "cuda"
     assert runtime["require_gpu"] is True
     assert runtime["mixed_precision"] == "fp16"
+    assert runtime["generation_batch_size"] == 1
+    assert runtime["max_input_tokens"] == 512
+    assert cfg["models"]["mgpt"]["torch_dtype"] == "float16"
+    assert cfg["models"]["bloom"]["torch_dtype"] == "float16"
 
 
 def test_gpu_math_interfaces():

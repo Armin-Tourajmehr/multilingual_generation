@@ -274,7 +274,7 @@ def _analyze_model(
 ):
     result_dir.mkdir(parents=True, exist_ok=True)
     gen_cfg = cfg["generation"]
-    batch_size = int(cfg["runtime"]["evaluation_batch_size"])
+    batch_size = int(cfg["runtime"].get("generation_batch_size", 1))
     token_writers: dict[str, PartitionWriter] = {}
     sentence_writers: dict[str, PartitionWriter] = {}
     output_writers: dict[str, PartitionWriter] = {}
@@ -290,13 +290,17 @@ def _analyze_model(
             ):
                 prompts = chunk[cfg["data"]["input_column"]].tolist()
                 sample_ids = chunk[cfg["data"]["sample_id_column"]].tolist()
-                token_ids, generated_texts, hidden_states, input_mask, input_width = generate_batch(
+                token_ids, generated_texts, hidden_states, input_width = generate_batch(
                     loaded, prompts, gen_cfg, cfg["runtime"]
                 )
 
+                # Count every source Aya row regardless of whether generation
+                # returned zero tokens for an individual sample.
+                counts[language] += len(sample_ids)
+
                 max_generated = max((len(ids) for ids in token_ids), default=0)
                 if max_generated == 0:
-                    del hidden_states, input_mask
+                    del hidden_states
                     continue
 
                 length_tensor = torch.tensor(
@@ -374,8 +378,7 @@ def _analyze_model(
                 sentence_writers.setdefault(language, PartitionWriter(sentence_path))
                 sentence_writers[language].write(sentence_rows)
 
-                counts[language] += len(sample_ids)
-                del hidden_states, input_mask, length_tensor, gen_positions, gen_mask
+                del hidden_states, length_tensor, gen_positions, gen_mask
     finally:
         for writers in (token_writers, sentence_writers, output_writers):
             for writer in writers.values():
@@ -415,6 +418,7 @@ def run(
         print("=" * 90)
         loaded = load_model(model_key, model_spec, cfg["runtime"])
         try:
+            print(f"[{model_key}] GPU allocated after model load: {torch.cuda.memory_allocated(loaded.device) / (1024**3):.2f} GiB")
             pcas = _load_pcas_or_fit(cfg, loaded, pca_root, force_refit=force_refit_pca)
             expected_sample_counts = dict(zip(validation["language"], validation["num_samples"]))
             gmms = _fit_aya_gmms(cfg, loaded, pcas, gmm_root, pca_root, expected_sample_counts)

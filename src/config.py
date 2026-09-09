@@ -74,6 +74,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
     runtime = cfg["runtime"]
     if runtime.get("evaluation_batch_size", 0) <= 0 or runtime.get("wikipedia_batch_size", 0) <= 0:
         raise ConfigError("runtime batch sizes must be positive.")
+    if int(runtime.get("generation_batch_size", 1)) != 1:
+        raise ConfigError("Kaggle-safe main experiment requires generation_batch_size=1.")
+    if int(runtime.get("max_input_tokens", 0)) <= 0:
+        raise ConfigError("runtime.max_input_tokens must be a positive integer for the Kaggle main experiment.")
     if runtime.get("require_gpu", False) and runtime.get("device") not in {"cuda", "gpu", "auto"}:
         raise ConfigError("GPU-only runtime.device must be cuda, gpu, or auto.")
     if str(runtime.get("mixed_precision", "fp16")).lower() not in {"fp16", "bf16", "none", "off", "false"}:

@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
+
+# Reduce CUDA allocator fragmentation on long-running Kaggle jobs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 

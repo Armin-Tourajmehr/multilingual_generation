@@ -62,12 +62,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
     rep = cfg["representation"]
     if rep.get("pca_dim") != 700:
         raise ConfigError("representation.pca_dim must be 700 for the main experiment.")
-    if rep.get("pca_solver") != "incremental":
-        raise ConfigError("Main experiment uses IncrementalPCA for memory-safe fitting.")
+    if rep.get("pca_solver") != "gpu_covariance":
+        raise ConfigError("Main experiment uses GPU covariance PCA; CPU IncrementalPCA is not used.")
     if rep.get("gmm_components") != 1 or rep.get("gmm_covariance_type") != "diag":
         raise ConfigError("Scalable main experiment requires one diagonal Gaussian component per language/layer.")
-    if rep.get("pca_batch_size", 0) < rep["pca_dim"]:
-        raise ConfigError("representation.pca_batch_size must be >= pca_dim.")
 
     gen = cfg["generation"]
     if not gen.get("max_new_tokens", 0) > 0:
@@ -76,8 +74,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     runtime = cfg["runtime"]
     if runtime.get("evaluation_batch_size", 0) <= 0 or runtime.get("wikipedia_batch_size", 0) <= 0:
         raise ConfigError("runtime batch sizes must be positive.")
-    if runtime.get("require_gpu", False) and runtime.get("device") not in {"cuda", "gpu"}:
-        raise ConfigError("When runtime.require_gpu is true, runtime.device must be cuda or gpu.")
+    if runtime.get("require_gpu", False) and runtime.get("device") not in {"cuda", "gpu", "auto"}:
+        raise ConfigError("GPU-only runtime.device must be cuda, gpu, or auto.")
     if str(runtime.get("mixed_precision", "fp16")).lower() not in {"fp16", "bf16", "none", "off", "false"}:
         raise ConfigError("runtime.mixed_precision must be fp16, bf16, or disabled.")
 

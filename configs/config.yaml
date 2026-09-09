@@ -1,6 +1,6 @@
 # ============================================================
 # MAIN EXPERIMENT CONFIGURATION
-# Wikipedia -> PCA fit -> GMM fit -> Aya full evaluation
+# Wikipedia -> GPU PCA fit -> full Aya GMM fit -> Aya generation/evaluation
 # ============================================================
 
 project:
@@ -50,9 +50,8 @@ language_names:
 # ------------------------------------------------------------
 # Aya evaluation data
 # ------------------------------------------------------------
-# All available Aya samples are evaluated. There is no train/test
-# split because PCA and Gaussian reference models are fitted only
-# on the independent Wikipedia corpus below.
+# All available Aya samples are used. GMMs are fitted on 100% of Aya
+# for each language. There is no train/test split.
 data:
   root_dir: data/aya_language_datasets
   input_column: inputs
@@ -60,7 +59,7 @@ data:
   sample_id_column: sample_id
 
 # ------------------------------------------------------------
-# Wikipedia reference data for PCA/Gaussian fitting
+# Wikipedia reference data for PCA fitting only
 # ------------------------------------------------------------
 # Equal deterministic cap prevents high-resource languages from
 # dominating the shared representation reference space.
@@ -117,8 +116,7 @@ generation:
 # ------------------------------------------------------------
 representation:
   pca_dim: 700
-  pca_solver: incremental
-  pca_batch_size: 4096
+  pca_solver: gpu_covariance
   gmm_components: 1
   gmm_covariance_type: diag
   gmm_reg_covar: 1.0e-6
@@ -135,15 +133,16 @@ runtime:
   trust_remote_code: false
   mixed_precision: fp16
   max_input_tokens: null
-  # Number of Wikipedia passages handled per pipeline batch.
-  # This is a data chunk; the model processes it on a single device.
-  wikipedia_batch_size: 32
+  # GPU batch sizes. All representation/statistical tensor math is CUDA-only.
+  wikipedia_batch_size: 8
   evaluation_batch_size: 8
+  # Path to the reusable PCA data. Relative paths are resolved from the repo root.
+  pca_data_path: outputs/pca_data
 
 # ------------------------------------------------------------
 # Outputs
 # ------------------------------------------------------------
 outputs:
   root_dir: outputs
-  model_dir: trained_language_models
+  gmm_dir: aya_gmms
   result_dir: analysis_results

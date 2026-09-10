@@ -28,6 +28,11 @@ def main() -> None:
         action="store_true",
         help="Recompute PCA even when a complete PCA directory already exists.",
     )
+    parser.add_argument(
+        "--force-refit-gmm",
+        action="store_true",
+        help="Recompute Aya GMMs even when a complete saved fit exists.",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
 
@@ -53,6 +58,7 @@ def main() -> None:
         cfg,
         pca_path=args.pca_path or cfg["runtime"].get("pca_data_path"),
         force_refit_pca=args.force_refit_pca,
+        force_refit_gmm=args.force_refit_gmm,
     )
 
 

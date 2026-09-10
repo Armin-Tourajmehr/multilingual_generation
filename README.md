@@ -249,3 +249,22 @@ pytest -q
 ```
 
 These tests validate the main configuration, the 18-language setup, GPU-only numerical interfaces, and the Kaggle-safe generation settings.
+
+
+## Runtime optimizations
+
+The main experiment is designed for a single NVIDIA T4-class GPU. PCA and Aya GMM statistics are computed on CUDA. Generation captures pre-emission hidden states directly from the same cached autoregressive generation pass, avoiding a second full-sequence forward pass. Saved PCA and complete Aya-GMM fits are reused automatically on subsequent runs; use `--force-refit-pca` or `--force-refit-gmm` only when a deliberate refit is required.
+
+The default Kaggle configuration uses FP16, generation batch size 1 for peak-memory safety, representation batch size 8, and a 512-token maximum input length. This processes every configured Aya sample row; only inputs longer than the configured token limit are truncated.
+
+Example:
+
+```bash
+python scripts/run_experiment.py --config configs/config.yaml
+```
+
+To deliberately rebuild saved artifacts:
+
+```bash
+python scripts/run_experiment.py --config configs/config.yaml --force-refit-pca --force-refit-gmm
+```

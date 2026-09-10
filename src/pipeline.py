@@ -16,6 +16,7 @@ from .gmm import (
     finalize_gmm,
     init_gmm_stats,
     save_gmm,
+    load_gmm,
     update_gmm_stats,
 )
 from .modeling import LoadedModel, forward_text_batch, generate_batch, load_model, release_model
@@ -167,6 +168,7 @@ def _fit_aya_gmms(
     gmm_root: Path,
     pca_root: Path,
     expected_sample_counts: dict[str, int],
+    force_refit: bool = False,
 ) -> list[GPULanguageGMM]:
     """Fit one diagonal, one-component GMM per language on 100% of Aya."""
 
@@ -265,6 +267,33 @@ def _fit_aya_gmms(
 
 
 
+def _load_gmms_or_fit(
+    cfg: dict[str, Any],
+    loaded: LoadedModel,
+    pcas: list[GPUPCA],
+    gmm_root: Path,
+    pca_root: Path,
+    expected_sample_counts: dict[str, int],
+) -> list[GPULanguageGMM]:
+    """Reuse a complete saved Aya-GMM fit; otherwise fit it once on all Aya."""
+    model_dir = gmm_root / loaded.name
+    paths = [model_dir / f"layer_{layer:03d}.pt" for layer in range(len(pcas))]
+    metadata_path = model_dir / "metadata.json"
+    if not force_refit and all(path.exists() for path in paths) and metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+            same_pca = Path(meta.get("pca_path", "")).resolve() == (pca_root / loaded.name).resolve()
+            same_langs = meta.get("languages") == list(cfg["languages"])
+            same_coverage = meta.get("coverage") == "100% of available configured Aya samples for each language"
+            if same_pca and same_langs and same_coverage:
+                print(f"[{loaded.name}] Reusing saved Aya GMMs from: {model_dir.resolve()}")
+                return [load_gmm(path, loaded.device) for path in paths]
+        except Exception as exc:
+            print(f"[{loaded.name}] Saved GMM metadata could not be validated ({exc}); refitting.")
+    return _fit_aya_gmms(cfg, loaded, pcas, gmm_root, pca_root, expected_sample_counts)
+
+
 def _analyze_model(
     cfg: dict[str, Any],
     loaded: LoadedModel,
@@ -280,6 +309,16 @@ def _analyze_model(
     output_writers: dict[str, PartitionWriter] = {}
     counts = {lang: 0 for lang in cfg["languages"]}
     pcols = [f"P_{x}" for x in cfg["languages"]]
+    token_decode_cache: dict[int, str] = {}
+
+    def decode_token(token_id: int) -> str:
+        token_id = int(token_id)
+        cached = token_decode_cache.get(token_id)
+        if cached is not None:
+            return cached
+        text = loaded.tokenizer.decode([token_id], skip_special_tokens=False)
+        token_decode_cache[token_id] = text
+        return text
 
     try:
         print(f"[{loaded.name}] Aya pass 2/2: generation + posterior analysis")
@@ -324,7 +363,8 @@ def _analyze_model(
 
                 # One PCA transform + one posterior call per layer/batch.
                 for layer, (pca, gmm) in enumerate(zip(pcas, gmms)):
-                    layer_hidden = hidden_states[layer][:, input_width : input_width + max_generated, :]
+                    # hidden_states contains pre-emission states for generated tokens only.
+                    layer_hidden = hidden_states[layer][:, :max_generated, :]
                     valid_hidden = layer_hidden[gen_mask]
                     Z = pca.transform(valid_hidden)
                     post = gmm.posterior(Z)
@@ -350,7 +390,7 @@ def _analyze_model(
                         rows = token_rows_by_layer[layer]
                         cpu_rows = post_cpu[offset : offset + sample_len]
                         for position, (token_id, posterior_values) in enumerate(zip(ids, cpu_rows)):
-                            token_text = loaded.tokenizer.decode([token_id], skip_special_tokens=False)
+                            token_text = decode_token(int(token_id))
                             row = {
                                 "model": loaded.name,
                                 "sample_id": sid,
@@ -393,6 +433,7 @@ def run(
     cfg: dict[str, Any],
     pca_path: str | Path | None = None,
     force_refit_pca: bool = False,
+    force_refit_gmm: bool = False,
 ) -> None:
     output_root = Path(cfg["outputs"]["root_dir"])
     output_root.mkdir(parents=True, exist_ok=True)
@@ -421,7 +462,9 @@ def run(
             print(f"[{model_key}] GPU allocated after model load: {torch.cuda.memory_allocated(loaded.device) / (1024**3):.2f} GiB")
             pcas = _load_pcas_or_fit(cfg, loaded, pca_root, force_refit=force_refit_pca)
             expected_sample_counts = dict(zip(validation["language"], validation["num_samples"]))
-            gmms = _fit_aya_gmms(cfg, loaded, pcas, gmm_root, pca_root, expected_sample_counts)
+            gmms = _load_gmms_or_fit(
+                cfg, loaded, pcas, gmm_root, pca_root, expected_sample_counts, force_refit=force_refit_gmm
+            )
             result_dir = output_root / cfg["outputs"]["result_dir"] / model_key
             _analyze_model(cfg, loaded, pcas, gmms, result_dir)
             del pcas, gmms

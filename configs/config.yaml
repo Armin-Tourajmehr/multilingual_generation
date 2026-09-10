@@ -100,7 +100,7 @@ models:
     use_chat_template: true
     chat_template_kwargs:
       enable_thinking: false
-    torch_dtype: auto
+    torch_dtype: float16
 
 # ------------------------------------------------------------
 # Aya generation

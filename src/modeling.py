@@ -157,6 +157,13 @@ def _generate_on_device(
     generation: dict[str, Any],
     runtime: dict[str, Any],
 ):
+    """Generate once and capture pre-emission hidden states from that same pass.
+
+    For a decoder-only causal LM, the hidden state at the final context position
+    is the state used to produce the logits for the next token. We therefore keep
+    that final-position state from each generation step instead of running a
+    second full forward over the generated sequence.
+    """
     if len(prompts) != 1:
         raise ValueError("Kaggle-safe generation requires generation_batch_size=1.")
 
@@ -164,10 +171,7 @@ def _generate_on_device(
     max_input_tokens = runtime.get("max_input_tokens") or None
     tok = _tokenize(loaded, rendered, runtime, max_input_tokens)
     input_width = int(tok["input_ids"].shape[1])
-    input_mask = tok["attention_mask"].bool()
 
-    # Generation is the highest peak-memory operation in the pipeline.
-    # Keeping the batch at 1 and model weights in FP16 makes mGPT viable on a T4.
     with _precision_context(loaded.device, runtime):
         generated = loaded.model.generate(
             **tok,
@@ -177,9 +181,12 @@ def _generate_on_device(
             top_p=float(generation["top_p"]) if generation.get("do_sample", True) else None,
             pad_token_id=loaded.tokenizer.pad_token_id,
             use_cache=True,
+            return_dict_in_generate=True,
+            output_hidden_states=True,
         )
 
-    generated_token_ids = generated[:, input_width:].detach().cpu().tolist()
+    sequences = generated.sequences
+    generated_token_ids = sequences[:, input_width:].detach().cpu().tolist()
     eos = loaded.tokenizer.eos_token_id
     if eos is not None:
         eos = int(eos)
@@ -190,27 +197,37 @@ def _generate_on_device(
                     break
     texts = loaded.tokenizer.batch_decode(generated_token_ids, skip_special_tokens=True)
 
-    # We need the generated sequence for the representation forward pass, but
-    # generation-time input tensors and tokenization wrappers can be released.
-    full_attention = torch.ones_like(generated, dtype=torch.long, device=loaded.device)
-    full_attention[:, :input_width] = input_mask.long()
-    del tok, input_mask
+    # Hugging Face returns one hidden-state tuple per generation step. For a
+    # decoder-only LM, the final position at each step is the representation
+    # used to predict the next token (pre-emission state). The first step may
+    # contain the complete prompt; later steps are one-token cache updates.
+    step_hidden_states = generated.hidden_states
+    if not step_hidden_states:
+        raise RuntimeError("Generation did not return hidden states; enable output_hidden_states=True.")
 
-    body = _base_model(loaded.model)
-    with _precision_context(loaded.device, runtime):
-        full_out = body(
-            input_ids=generated,
-            attention_mask=full_attention,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False,
+    n_steps = len(generated_token_ids[0])
+    if len(step_hidden_states) < n_steps:
+        raise RuntimeError(
+            f"Generation returned {len(step_hidden_states)} hidden-state steps for {n_steps} generated tokens."
         )
 
-    hidden_states = list(full_out.hidden_states)
-    # Do not keep additional references to the large wrapper/mask tensor.
-    del full_out, full_attention, generated
-    return generated_token_ids, texts, hidden_states, input_width
+    # Keep only the final-position state from each decision step. This produces
+    # [1, generated_len, hidden_dim] per layer and avoids a second full-sequence
+    # forward pass.
+    n_layers = len(step_hidden_states[0])
+    hidden_states: list[torch.Tensor] = []
+    for layer in range(n_layers):
+        pieces = []
+        for step_idx in range(n_steps):
+            h = step_hidden_states[step_idx][layer]
+            pieces.append(h[:, -1, :])
+        hidden_states.append(torch.cat(pieces, dim=1).view(1, n_steps, -1))
 
+    # Remove the generation output wrapper and step tuples immediately. The
+    # compact per-token tensors above are the only generation representations
+    # retained for the rest of the pipeline.
+    del generated, step_hidden_states, tok, rendered, sequences
+    return generated_token_ids, texts, hidden_states, input_width
 
 def generate_batch(loaded: LoadedModel, prompts: list[str], generation: dict[str, Any], runtime: dict[str, Any]):
     return _generate_on_device(loaded, prompts, generation, runtime)

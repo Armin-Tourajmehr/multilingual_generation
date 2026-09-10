@@ -274,6 +274,7 @@ def _load_gmms_or_fit(
     gmm_root: Path,
     pca_root: Path,
     expected_sample_counts: dict[str, int],
+    force_refit: bool = False,
 ) -> list[GPULanguageGMM]:
     """Reuse a complete saved Aya-GMM fit; otherwise fit it once on all Aya."""
     model_dir = gmm_root / loaded.name

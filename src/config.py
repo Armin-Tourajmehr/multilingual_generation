@@ -210,13 +210,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
             "runtime batch sizes must be positive."
         )
 
-    if int(
-        runtime.get("generation_batch_size", 1)
-    ) != 1:
-        raise ConfigError(
-            "Kaggle-safe main experiment requires "
-            "generation_batch_size=1."
-        )
+    #if int(runtime.get("generation_batch_size", 1)) != 1:
+        #raise ConfigError(
+            #"Kaggle-safe main experiment requires "
+            #"generation_batch_size=1.")
 
     if int(
         runtime.get("max_input_tokens", 0)

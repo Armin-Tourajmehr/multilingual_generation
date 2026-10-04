@@ -87,7 +87,7 @@ models:
     torch_dtype: float16
 
   bloom:
-    enabled: true
+    enabled: false
     model_name: bigscience/bloom-560m
     model_type: causal_lm
     use_chat_template: false
@@ -120,7 +120,7 @@ representation:
   gmm_components: 1
   gmm_covariance_type: diag
   gmm_reg_covar: 1.0e-6
-  equal_language_priors: true
+  equal_language_priors: false
 
 # ------------------------------------------------------------
 # Runtime

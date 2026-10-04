@@ -229,7 +229,6 @@ def _fit_pca_on_wikipedia(
                     loaded,
                     texts,
                     max_tokens,
-                    cfg["runtime"],
                 )
             )
 

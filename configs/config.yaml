@@ -87,7 +87,7 @@ models:
     torch_dtype: float16
 
   bloom:
-    enabled: false
+    enabled: true
     model_name: bigscience/bloom-560m
     model_type: causal_lm
     use_chat_template: false
@@ -120,7 +120,7 @@ representation:
   gmm_components: 1
   gmm_covariance_type: diag
   gmm_reg_covar: 1.0e-6
-  equal_language_priors: false
+  equal_language_priors: true
 
 # ------------------------------------------------------------
 # Runtime
@@ -135,11 +135,10 @@ runtime:
   # Truncate long Aya inputs before the model forward/generation to keep a single T4 safe.
   # This still processes 100% of Aya sample rows; only overlong prompts are truncated.
   max_input_tokens: 512
-  generation_batch_size: 4
+  generation_batch_size: 1
   # GPU batch sizes. All representation/statistical tensor math is CUDA-only.
   wikipedia_batch_size: 8
   evaluation_batch_size: 8
-  analysis_write_buffer: 8192
   # Path to the reusable PCA data. Relative paths are resolved from the repo root.
   pca_data_path: outputs/pca_data
 

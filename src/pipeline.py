@@ -43,23 +43,59 @@ from .pca_gpu import (
 )
 
 
+# ============================================================
+# PARQUET WRITER
+# ============================================================
+
 class PartitionWriter:
-    """Append row batches to one compressed Parquet file."""
+    """
+    Buffered Parquet writer.
 
-    def __init__(self, path: Path):
+    Instead of creating a pandas DataFrame and writing a tiny
+    Parquet row-group for every generation batch, rows are
+    accumulated and periodically flushed.
+
+    This preserves all rows while significantly reducing
+    Python/Arrow/I/O overhead.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        buffer_size: int = 8192,
+    ):
         self.path = path
-        self.writer = None
+        self.buffer_size = int(
+            buffer_size
+        )
 
-    def write(self, rows: list[dict[str, Any]]):
+        self.writer = None
+        self.buffer: list[
+            dict[str, Any]
+        ] = []
+
+    def write(
+        self,
+        rows: list[dict[str, Any]],
+    ):
         if not rows:
             return
 
-        table = pa.Table.from_pandas(
-            pd.DataFrame(rows),
-            preserve_index=False,
+        self.buffer.extend(rows)
+
+        if len(self.buffer) >= self.buffer_size:
+            self.flush()
+
+    def flush(self):
+        if not self.buffer:
+            return
+
+        table = pa.Table.from_pylist(
+            self.buffer
         )
 
         if self.writer is None:
+
             self.path.parent.mkdir(
                 parents=True,
                 exist_ok=True,
@@ -71,18 +107,30 @@ class PartitionWriter:
                 compression="zstd",
             )
 
-        self.writer.write_table(table)
+        self.writer.write_table(
+            table
+        )
+
+        self.buffer.clear()
 
     def close(self):
+        self.flush()
+
         if self.writer is not None:
             self.writer.close()
+            self.writer = None
 
+
+# ============================================================
+# DATA HELPERS
+# ============================================================
 
 def _language_batches(
     cfg: dict[str, Any],
     language: str,
     batch_size: int,
 ) -> Iterator[list[str]]:
+
     texts: list[str] = []
 
     for row in iter_wikipedia_documents(
@@ -90,10 +138,15 @@ def _language_batches(
         language,
         seed_offset=sum(
             (i + 1) * ord(c)
-            for i, c in enumerate(language)
+            for i, c in enumerate(
+                language
+            )
         ),
     ):
-        texts.append(row["text"])
+
+        texts.append(
+            row["text"]
+        )
 
         if len(texts) == batch_size:
             yield texts
@@ -112,26 +165,24 @@ def _fit_pca_on_wikipedia(
     loaded: LoadedModel,
     pca_root: Path,
 ) -> list[GPUPCA]:
-    """
-    Fit exact covariance PCA on the full configured
-    Wikipedia reference stream.
-
-    All vector math stays on CUDA.
-    """
 
     if loaded.device.type != "cuda":
         raise RuntimeError(
             "PCA fitting requires CUDA."
         )
 
-    rep = cfg["representation"]
+    rep = cfg[
+        "representation"
+    ]
 
     n_components = int(
         rep["pca_dim"]
     )
 
     batch_size = int(
-        cfg["runtime"]["wikipedia_batch_size"]
+        cfg["runtime"][
+            "wikipedia_batch_size"
+        ]
     )
 
     max_tokens = int(
@@ -140,9 +191,7 @@ def _fit_pca_on_wikipedia(
         ]
     )
 
-    accumulators: list[
-        GPUPCACovarianceAccumulator
-    ] | None = None
+    accumulators = None
 
     reference_document_counts = {
         lang: 0
@@ -150,12 +199,14 @@ def _fit_pca_on_wikipedia(
     }
 
     print(
-        f"[{loaded.name}] Wikipedia pass: "
-        f"fitting GPU PCA "
+        f"[{loaded.name}] "
+        f"Wikipedia pass: fitting GPU PCA "
         f"({n_components} components)"
     )
 
-    for language in cfg["languages"]:
+    for language in cfg[
+        "languages"
+    ]:
 
         for texts in tqdm(
             _language_batches(
@@ -185,7 +236,9 @@ def _fit_pca_on_wikipedia(
             if accumulators is None:
 
                 hidden_dim = int(
-                    hidden_states[0].shape[-1]
+                    hidden_states[
+                        0
+                    ].shape[-1]
                 )
 
                 n_layers = len(
@@ -197,7 +250,9 @@ def _fit_pca_on_wikipedia(
                         hidden_dim,
                         loaded.device,
                     )
-                    for _ in range(n_layers)
+                    for _ in range(
+                        n_layers
+                    )
                 ]
 
                 if n_components > hidden_dim:
@@ -221,17 +276,23 @@ def _fit_pca_on_wikipedia(
 
                 X = hidden[mask]
 
-                accumulators[layer].update(X)
+                accumulators[
+                    layer
+                ].update(X)
 
-            del hidden_states, mask
+            del hidden_states
+            del mask
 
     if accumulators is None:
         raise RuntimeError(
-            "Wikipedia stream produced no batches."
+            "Wikipedia stream produced "
+            "no batches."
         )
 
     pcas = [
-        acc.finalize(n_components)
+        acc.finalize(
+            n_components
+        )
         for acc in accumulators
     ]
 
@@ -254,7 +315,9 @@ def _fit_pca_on_wikipedia(
                     ]
                 ),
             }
-            for lang in cfg["languages"]
+            for lang in cfg[
+                "languages"
+            ]
         ]
     )
 
@@ -285,7 +348,8 @@ def _fit_pca_on_wikipedia(
     }
 
     with (
-        model_pca_dir / "metadata.json"
+        model_pca_dir
+        / "metadata.json"
     ).open(
         "w",
         encoding="utf-8",
@@ -298,7 +362,9 @@ def _fit_pca_on_wikipedia(
             indent=2,
         )
 
-    for layer, pca in enumerate(pcas):
+    for layer, pca in enumerate(
+        pcas
+    ):
 
         save_pca(
             model_pca_dir
@@ -339,7 +405,8 @@ def _load_pcas_or_fit(
 
     if (
         not force_refit
-        and len(paths) == expected_layers
+        and len(paths)
+        == expected_layers
     ):
 
         pcas = [
@@ -357,7 +424,8 @@ def _load_pcas_or_fit(
         )
 
         if any(
-            p.n_components != pca_dim
+            p.n_components
+            != pca_dim
             for p in pcas
         ):
             raise RuntimeError(
@@ -377,7 +445,8 @@ def _load_pcas_or_fit(
     if (
         paths
         and not force_refit
-        and len(paths) != expected_layers
+        and len(paths)
+        != expected_layers
     ):
 
         raise RuntimeError(
@@ -409,17 +478,6 @@ def _fit_aya_gmms(
     expected_sample_counts: dict[str, int],
     force_refit: bool = False,
 ) -> list[GPULanguageGMM]:
-    """
-    Fit one diagonal, one-component GMM per language
-    on 100% of Aya.
-
-    Language priors are empirical:
-
-        P(language) = N_language / total_N
-
-    where N_language is the number of Aya samples
-    for that language.
-    """
 
     languages = list(
         cfg["languages"]
@@ -444,17 +502,17 @@ def _fit_aya_gmms(
         ]
     )
 
-    # Number of Aya samples actually processed.
     sample_counts = {
         lang: 0
         for lang in languages
     }
 
-    # Streaming GMM statistics.
     sums, sums_sq, counts = (
         init_gmm_stats(
             n_layers=len(pcas),
-            n_languages=len(languages),
+            n_languages=len(
+                languages
+            ),
             pca_dim=pca_dim,
             device=loaded.device,
         )
@@ -466,14 +524,12 @@ def _fit_aya_gmms(
         f"fitting GMMs on ALL Aya samples"
     )
 
-    # --------------------------------------------------------
-    # Stream through all Aya samples
-    # --------------------------------------------------------
-
     for language in languages:
 
         language_idx = (
-            lang_to_idx[language]
+            lang_to_idx[
+                language
+            ]
         )
 
         for chunk in tqdm(
@@ -504,8 +560,7 @@ def _fit_aya_gmms(
                     prompts,
                     cfg["runtime"].get(
                         "max_input_tokens"
-                    )
-                    or None,
+                    ) or None,
                     cfg["runtime"],
                 )
             )
@@ -521,10 +576,10 @@ def _fit_aya_gmms(
                 if X.numel() == 0:
                     continue
 
-                # PCA projection
-                Z = pca.transform(X)
+                Z = pca.transform(
+                    X
+                )
 
-                # Update Gaussian statistics
                 update_gmm_stats(
                     sums,
                     sums_sq,
@@ -534,11 +589,8 @@ def _fit_aya_gmms(
                     Z,
                 )
 
-            del hidden_states, mask
-
-    # --------------------------------------------------------
-    # Full-data audit
-    # --------------------------------------------------------
+            del hidden_states
+            del mask
 
     if (
         sample_counts
@@ -552,10 +604,6 @@ def _fit_aya_gmms(
             f"processed="
             f"{sample_counts}"
         )
-
-    # --------------------------------------------------------
-    # Empirical language priors
-    # --------------------------------------------------------
 
     language_priors = (
         build_language_priors(
@@ -582,10 +630,6 @@ def _fit_aya_gmms(
             f"{prior:.6f}"
         )
 
-    # --------------------------------------------------------
-    # Finalize GMM
-    # --------------------------------------------------------
-
     gmms = finalize_gmm(
         sums,
         sums_sq,
@@ -598,10 +642,6 @@ def _fit_aya_gmms(
         ),
         language_priors=language_priors,
     )
-
-    # --------------------------------------------------------
-    # Save GMMs
-    # --------------------------------------------------------
 
     model_dir = (
         gmm_root / loaded.name
@@ -624,10 +664,6 @@ def _fit_aya_gmms(
                 expected_sample_counts
             ),
         )
-
-    # --------------------------------------------------------
-    # Save token-vector counts
-    # --------------------------------------------------------
 
     counts_df = pd.DataFrame(
         [
@@ -656,10 +692,6 @@ def _fit_aya_gmms(
         index=False,
     )
 
-    # --------------------------------------------------------
-    # Save sample-count audit
-    # --------------------------------------------------------
-
     pd.DataFrame(
         [
             {
@@ -683,10 +715,6 @@ def _fit_aya_gmms(
         index=False,
     )
 
-    # --------------------------------------------------------
-    # Save metadata
-    # --------------------------------------------------------
-
     metadata = {
         "model": loaded.name,
         "training_corpus": "Aya",
@@ -705,13 +733,9 @@ def _fit_aya_gmms(
             ]
         ),
         "languages": languages,
-
-        # Important:
-        # priors are NOT uniform.
         "prior_type": (
             "empirical_sample_count"
         ),
-
         "sample_counts": {
             language: int(
                 expected_sample_counts[
@@ -720,7 +744,6 @@ def _fit_aya_gmms(
             )
             for language in languages
         },
-
         "pca_path": str(
             (
                 pca_root
@@ -730,7 +753,8 @@ def _fit_aya_gmms(
     }
 
     with (
-        model_dir / "metadata.json"
+        model_dir
+        / "metadata.json"
     ).open(
         "w",
         encoding="utf-8",
@@ -743,7 +767,9 @@ def _fit_aya_gmms(
             indent=2,
         )
 
-    del sums, sums_sq, counts
+    del sums
+    del sums_sq
+    del counts
 
     return gmms
 
@@ -757,12 +783,6 @@ def _load_gmms_or_fit(
     expected_sample_counts: dict[str, int],
     force_refit: bool = False,
 ) -> list[GPULanguageGMM]:
-    """
-    Load saved Aya GMMs if they match the current
-    empirical-prior configuration.
-
-    Otherwise fit them on all Aya samples.
-    """
 
     model_dir = (
         gmm_root / loaded.name
@@ -777,7 +797,8 @@ def _load_gmms_or_fit(
     ]
 
     metadata_path = (
-        model_dir / "metadata.json"
+        model_dir
+        / "metadata.json"
     )
 
     expected_counts = {
@@ -786,12 +807,10 @@ def _load_gmms_or_fit(
                 language
             ]
         )
-        for language in cfg["languages"]
+        for language in cfg[
+            "languages"
+        ]
     }
-
-    # --------------------------------------------------------
-    # Try to reuse existing GMM
-    # --------------------------------------------------------
 
     if (
         not force_refit
@@ -892,10 +911,6 @@ def _load_gmms_or_fit(
                 f"({exc}); refitting."
             )
 
-    # --------------------------------------------------------
-    # Fit from Aya
-    # --------------------------------------------------------
-
     return _fit_aya_gmms(
         cfg,
         loaded,
@@ -908,7 +923,7 @@ def _load_gmms_or_fit(
 
 
 # ============================================================
-# ANALYSIS
+# ANALYSIS HELPERS
 # ============================================================
 
 def _analyze_model(
@@ -918,12 +933,15 @@ def _analyze_model(
     gmms: list[GPULanguageGMM],
     result_dir: Path,
 ):
+
     result_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    gen_cfg = cfg["generation"]
+    gen_cfg = cfg[
+        "generation"
+    ]
 
     batch_size = int(
         cfg["runtime"].get(
@@ -931,6 +949,16 @@ def _analyze_model(
             1,
         )
     )
+
+    if batch_size < 1:
+        raise ValueError(
+            "generation_batch_size "
+            "must be >= 1."
+        )
+
+    # --------------------------------------------------------
+    # Writers
+    # --------------------------------------------------------
 
     token_writers: dict[
         str,
@@ -949,12 +977,16 @@ def _analyze_model(
 
     counts = {
         lang: 0
-        for lang in cfg["languages"]
+        for lang in cfg[
+            "languages"
+        ]
     }
 
     pcols = [
         f"P_{x}"
-        for x in cfg["languages"]
+        for x in cfg[
+            "languages"
+        ]
     ]
 
     token_decode_cache: dict[
@@ -970,10 +1002,8 @@ def _analyze_model(
             token_id
         )
 
-        cached = (
-            token_decode_cache.get(
-                token_id
-            )
+        cached = token_decode_cache.get(
+            token_id
         )
 
         if cached is not None:
@@ -990,6 +1020,17 @@ def _analyze_model(
 
         return text
 
+    # --------------------------------------------------------
+    # Buffered writer size
+    # --------------------------------------------------------
+
+    buffer_size = int(
+        cfg["runtime"].get(
+            "analysis_write_buffer",
+            8192,
+        )
+    )
+
     try:
 
         print(
@@ -998,7 +1039,50 @@ def _analyze_model(
             f"generation + posterior analysis"
         )
 
-        for language in cfg["languages"]:
+        print(
+            f"[{loaded.name}] "
+            f"Generation batch size: "
+            f"{batch_size}"
+        )
+
+        for language in cfg[
+            "languages"
+        ]:
+
+            # ------------------------------------------------
+            # Create writers once per language
+            # ------------------------------------------------
+
+            output_writers[
+                language
+            ] = PartitionWriter(
+                result_dir
+                / "generated_outputs"
+                / f"{language}.parquet",
+                buffer_size=buffer_size,
+            )
+
+            token_writers[
+                language
+            ] = PartitionWriter(
+                result_dir
+                / "token_posteriors"
+                / f"{language}.parquet",
+                buffer_size=buffer_size,
+            )
+
+            sentence_writers[
+                language
+            ] = PartitionWriter(
+                result_dir
+                / "sentence_level_posteriors"
+                / f"{language}.parquet",
+                buffer_size=buffer_size,
+            )
+
+            # ------------------------------------------------
+            # Aya
+            # ------------------------------------------------
 
             for chunk in tqdm(
                 iter_aya_batches(
@@ -1029,6 +1113,7 @@ def _analyze_model(
                     generated_texts,
                     hidden_states,
                     input_width,
+                    lengths,
                 ) = generate_batch(
                     loaded,
                     prompts,
@@ -1036,16 +1121,12 @@ def _analyze_model(
                     cfg["runtime"],
                 )
 
-                # Count every source Aya row.
                 counts[
                     language
                 ] += len(sample_ids)
 
                 max_generated = max(
-                    (
-                        len(ids)
-                        for ids in token_ids
-                    ),
+                    lengths,
                     default=0,
                 )
 
@@ -1055,29 +1136,8 @@ def _analyze_model(
 
                     continue
 
-                length_tensor = torch.tensor(
-                    [
-                        len(ids)
-                        for ids in token_ids
-                    ],
-                    device=loaded.device,
-                    dtype=torch.long,
-                )
-
-                gen_positions = (
-                    torch.arange(
-                        max_generated,
-                        device=loaded.device,
-                    ).unsqueeze(0)
-                )
-
-                gen_mask = (
-                    gen_positions
-                    < length_tensor.unsqueeze(1)
-                )
-
                 # ------------------------------------------------
-                # Generated output rows
+                # Generated outputs
                 # ------------------------------------------------
 
                 output_rows = [
@@ -1096,24 +1156,24 @@ def _analyze_model(
                     )
                 ]
 
-                token_rows_by_layer: dict[
-                    int,
-                    list[
-                        dict[str, Any]
-                    ],
-                ] = {
-                    i: []
-                    for i in range(
-                        len(pcas)
-                    )
-                }
-
-                sentence_rows: list[
-                    dict[str, Any]
-                ] = []
+                output_writers[
+                    language
+                ].write(
+                    output_rows
+                )
 
                 # ------------------------------------------------
-                # PCA + GMM posterior
+                # Token posterior analysis
+                # ------------------------------------------------
+                #
+                # Every layer is analyzed.
+                #
+                # Every valid generated token is analyzed.
+                #
+                # Every token gets:
+                #
+                # P(ar), P(bn), ..., P(vi)
+                #
                 # ------------------------------------------------
 
                 for layer, (
@@ -1126,8 +1186,6 @@ def _analyze_model(
                     )
                 ):
 
-                    # Hidden states for generated
-                    # tokens only.
                     layer_hidden = (
                         hidden_states[
                             layer
@@ -1138,19 +1196,55 @@ def _analyze_model(
                         ]
                     )
 
+                    # Flatten valid tokens:
+                    #
+                    # [B, T, D]
+                    #       ↓
+                    # [N_valid, D]
+                    valid_mask = (
+                        torch.arange(
+                            max_generated,
+                            device=loaded.device,
+                        ).unsqueeze(0)
+                        < torch.tensor(
+                            lengths,
+                            device=loaded.device,
+                            dtype=torch.long,
+                        ).unsqueeze(1)
+                    )
+
                     valid_hidden = (
                         layer_hidden[
-                            gen_mask
+                            valid_mask
                         ]
                     )
+
+                    if valid_hidden.numel() == 0:
+                        continue
+
+                    # ------------------------------------------------
+                    # PCA
+                    # ------------------------------------------------
 
                     Z = pca.transform(
                         valid_hidden
                     )
 
+                    # ------------------------------------------------
+                    # GMM posterior
+                    # ------------------------------------------------
+
                     post = gmm.posterior(
                         Z
                     )
+
+                    # ------------------------------------------------
+                    # One GPU → CPU transfer for ALL token
+                    # posterior values in this layer.
+                    #
+                    # Previously there were additional CPU
+                    # synchronizations for sentence means.
+                    # ------------------------------------------------
 
                     post_cpu = (
                         post
@@ -1159,36 +1253,78 @@ def _analyze_model(
                         .tolist()
                     )
 
+                    # Sentence means are calculated on GPU.
+                    #
+                    # We use the same token posterior values,
+                    # so sentence-level results remain unchanged.
+                    # ------------------------------------------------
+
+                    sentence_means = []
+
                     offset = 0
+
+                    for sample_len in lengths:
+                        if sample_len == 0:
+                            sentence_means.append(None)
+                        else:
+                            sentence_means.append(
+                                post[
+                                    offset:offset + sample_len
+                                ].mean(dim=0)
+                            )
+                            offset += sample_len
+
+                    non_empty_means = [
+                        x for x in sentence_means
+                        if x is not None
+                    ]
+
+                    if non_empty_means:
+                        sentence_means_cpu = (
+                            torch.stack(
+                                non_empty_means,
+                                dim=0,
+                            )
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                    else:
+                        sentence_means_cpu = []
+
+                    # ------------------------------------------------
+                    # Build rows
+                    # ------------------------------------------------
+
+                    offset = 0
+                    mean_index = 0
+
+                    token_rows = []
+                    sentence_rows = []
 
                     for sample_index, (
                         sid,
                         ids,
+                        sample_len,
                     ) in enumerate(
                         zip(
                             sample_ids,
                             token_ids,
+                            lengths,
                         )
                     ):
-
-                        sample_len = len(
-                            ids
-                        )
 
                         if sample_len == 0:
                             continue
 
-                        sample_post = post[
-                            offset:
-                            offset + sample_len
-                        ]
+                        # --------------------------------------------
+                        # Sentence posterior
+                        # --------------------------------------------
 
                         means = (
-                            sample_post
-                            .mean(dim=0)
-                            .detach()
-                            .cpu()
-                            .tolist()
+                            sentence_means_cpu[
+                                mean_index
+                            ]
                         )
 
                         sentence_rows.append(
@@ -1198,8 +1334,9 @@ def _analyze_model(
                                 "input_language": language,
                                 "layer": layer,
                                 **{
-                                    c: float(v)
-                                    for c, v in zip(
+                                    col: float(value)
+                                    for col, value
+                                    in zip(
                                         pcols,
                                         means,
                                     )
@@ -1207,13 +1344,13 @@ def _analyze_model(
                             }
                         )
 
-                        rows = (
-                            token_rows_by_layer[
-                                layer
-                            ]
-                        )
+                        mean_index += 1
 
-                        cpu_rows = (
+                        # --------------------------------------------
+                        # Token posterior
+                        # --------------------------------------------
+
+                        sample_post_cpu = (
                             post_cpu[
                                 offset:
                                 offset
@@ -1227,15 +1364,13 @@ def _analyze_model(
                         ) in enumerate(
                             zip(
                                 ids,
-                                cpu_rows,
+                                sample_post_cpu,
                             )
                         ):
 
                             token_text = (
                                 decode_token(
-                                    int(
-                                        token_id
-                                    )
+                                    token_id
                                 )
                             )
 
@@ -1243,12 +1378,8 @@ def _analyze_model(
                                 "model": loaded.name,
                                 "sample_id": sid,
                                 "input_language": language,
-                                "token_position": (
-                                    position
-                                ),
-                                "sequence_position": (
-                                    position
-                                ),
+                                "token_position": position,
+                                "sequence_position": position,
                                 "token": token_text,
                                 "token_id": int(
                                     token_id
@@ -1258,95 +1389,52 @@ def _analyze_model(
 
                             row.update(
                                 {
-                                    c: float(v)
-                                    for c, v in zip(
+                                    col: float(value)
+                                    for col, value
+                                    in zip(
                                         pcols,
                                         posterior_values,
                                     )
                                 }
                             )
 
-                            rows.append(row)
+                            token_rows.append(
+                                row
+                            )
 
                         offset += sample_len
 
-                # ------------------------------------------------
-                # Save generated outputs
-                # ------------------------------------------------
-
-                outputs_path = (
-                    result_dir
-                    / "generated_outputs"
-                    / f"{language}.parquet"
-                )
-
-                output_writers.setdefault(
-                    language,
-                    PartitionWriter(
-                        outputs_path
-                    ),
-                )
-
-                output_writers[
-                    language
-                ].write(
-                    output_rows
-                )
-
-                # ------------------------------------------------
-                # Save token posteriors
-                # ------------------------------------------------
-
-                token_path = (
-                    result_dir
-                    / "token_posteriors"
-                    / f"{language}.parquet"
-                )
-
-                token_writers.setdefault(
-                    language,
-                    PartitionWriter(
-                        token_path
-                    ),
-                )
-
-                for rows in (
-                    token_rows_by_layer.values()
-                ):
+                    # ------------------------------------------------
+                    # Write this layer's results into buffered
+                    # Parquet writers.
+                    #
+                    # They are NOT physically written for every
+                    # generation batch because PartitionWriter
+                    # buffers rows.
+                    # ------------------------------------------------
 
                     token_writers[
                         language
-                    ].write(rows)
+                    ].write(
+                        token_rows
+                    )
 
-                # ------------------------------------------------
-                # Save sentence posteriors
-                # ------------------------------------------------
+                    sentence_writers[
+                        language
+                    ].write(
+                        sentence_rows
+                    )
 
-                sentence_path = (
-                    result_dir
-                    / "sentence_level_posteriors"
-                    / f"{language}.parquet"
-                )
+                    del Z
+                    del post
+                    del post_cpu
+                    del valid_hidden
+                    del layer_hidden
+                    del valid_mask
+                    del sentence_means
+                    del sentence_means_cpu
 
-                sentence_writers.setdefault(
-                    language,
-                    PartitionWriter(
-                        sentence_path
-                    ),
-                )
-
-                sentence_writers[
-                    language
-                ].write(
-                    sentence_rows
-                )
-
-                del (
-                    hidden_states,
-                    length_tensor,
-                    gen_positions,
-                    gen_mask,
-                )
+                del hidden_states
 
     finally:
 
@@ -1356,14 +1444,12 @@ def _analyze_model(
             output_writers,
         ):
 
-            for writer in (
-                writers.values()
-            ):
+            for writer in writers.values():
                 writer.close()
 
-    # ------------------------------------------------------------
-    # Save analysis counts
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # Analysis counts
+    # --------------------------------------------------------
 
     pd.DataFrame(
         [
@@ -1478,13 +1564,16 @@ def run(
     )
 
     # ---------------------------------------------------------
-    # Run enabled models
+    # Enabled models
     # ---------------------------------------------------------
 
     for model_key, model_spec in [
         (k, v)
         for k, v in cfg["models"].items()
-        if v.get("enabled", False)
+        if v.get(
+            "enabled",
+            False,
+        )
     ]:
 
         print(
@@ -1511,7 +1600,8 @@ def run(
 
             print(
                 f"[{model_key}] "
-                f"GPU allocated after model load: "
+                f"GPU allocated after "
+                f"model load: "
                 f"{torch.cuda.memory_allocated(loaded.device) / (1024**3):.2f} GiB"
             )
 
@@ -1534,7 +1624,9 @@ def run(
 
             expected_sample_counts = dict(
                 zip(
-                    validation["language"],
+                    validation[
+                        "language"
+                    ],
                     validation[
                         "num_samples"
                     ],
@@ -1558,7 +1650,7 @@ def run(
             )
 
             # -------------------------------------------------
-            # Generation + analysis
+            # Pass 2
             # -------------------------------------------------
 
             result_dir = (
@@ -1577,7 +1669,8 @@ def run(
                 result_dir,
             )
 
-            del pcas, gmms
+            del pcas
+            del gmms
 
         finally:
 

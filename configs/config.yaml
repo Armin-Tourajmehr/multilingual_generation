@@ -135,10 +135,11 @@ runtime:
   # Truncate long Aya inputs before the model forward/generation to keep a single T4 safe.
   # This still processes 100% of Aya sample rows; only overlong prompts are truncated.
   max_input_tokens: 512
-  generation_batch_size: 1
+  generation_batch_size: 4
   # GPU batch sizes. All representation/statistical tensor math is CUDA-only.
   wikipedia_batch_size: 8
   evaluation_batch_size: 8
+  analysis_write_buffer: 8192
   # Path to the reusable PCA data. Relative paths are resolved from the repo root.
   pca_data_path: outputs/pca_data
 

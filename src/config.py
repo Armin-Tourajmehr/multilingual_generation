@@ -19,6 +19,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    if not isinstance(cfg, dict):
+        raise ConfigError("Configuration must be a YAML mapping.")
+
     validate_config(cfg)
 
     return cfg
@@ -55,6 +58,11 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
     langs = cfg["languages"]
 
+    if not isinstance(langs, list) or not langs:
+        raise ConfigError(
+            "languages must be a non-empty list."
+        )
+
     if len(langs) != len(set(langs)):
         raise ConfigError(
             "Duplicate languages in config."
@@ -80,6 +88,34 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if not data.get("root_dir"):
         raise ConfigError(
             "data.root_dir is required."
+        )
+
+    if not data.get("sample_id_column"):
+        raise ConfigError(
+            "data.sample_id_column is required."
+        )
+
+    aya_max_samples = data.get(
+        "max_samples_per_language"
+    )
+
+    if (
+        not isinstance(aya_max_samples, int)
+        or aya_max_samples <= 0
+    ):
+        raise ConfigError(
+            "data.max_samples_per_language must be "
+            "a positive integer."
+        )
+
+    sampling_seed = data.get(
+        "sampling_seed",
+        cfg["project"].get("seed", 42),
+    )
+
+    if not isinstance(sampling_seed, int):
+        raise ConfigError(
+            "data.sampling_seed must be an integer."
         )
 
     # --------------------------------------------------------
@@ -196,6 +232,25 @@ def validate_config(cfg: dict[str, Any]) -> None:
             "generation.max_new_tokens must be positive."
         )
 
+    if gen.get("do_sample", True):
+        temperature = float(
+            gen.get("temperature", 0.7)
+        )
+
+        top_p = float(
+            gen.get("top_p", 0.9)
+        )
+
+        if temperature <= 0:
+            raise ConfigError(
+                "generation.temperature must be positive."
+            )
+
+        if not 0 < top_p <= 1:
+            raise ConfigError(
+                "generation.top_p must be in (0, 1]."
+            )
+
     # --------------------------------------------------------
     # Runtime
     # --------------------------------------------------------
@@ -210,12 +265,32 @@ def validate_config(cfg: dict[str, Any]) -> None:
             "runtime batch sizes must be positive."
         )
 
-    if int(
-        runtime.get("generation_batch_size", 1)
-    ) != 1:
+    # --------------------------------------------------------
+    # Generation batch size
+    #
+    # IMPORTANT:
+    # Batch sizes greater than 1 are now supported.
+    #
+    # Valid examples:
+    #   generation_batch_size: 1
+    #   generation_batch_size: 2
+    #   generation_batch_size: 4
+    #
+    # This used to be hard-coded to 1 because the old
+    # modeling.py only supported single-example generation.
+    # --------------------------------------------------------
+
+    generation_batch_size = int(
+        runtime.get(
+            "generation_batch_size",
+            1,
+        )
+    )
+
+    if generation_batch_size <= 0:
         raise ConfigError(
-            "Kaggle-safe main experiment requires "
-            "generation_batch_size=1."
+            "runtime.generation_batch_size must be "
+            "a positive integer."
         )
 
     if int(

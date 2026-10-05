@@ -463,7 +463,7 @@ def _fit_aya_gmms(
     print(
         f"[{loaded.name}] "
         f"Aya pass 1/2: "
-        f"fitting GMMs on ALL Aya samples"
+        f"fitting GMMs on the configured Aya subset"
     )
 
     # --------------------------------------------------------

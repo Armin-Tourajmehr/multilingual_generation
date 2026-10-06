@@ -82,14 +82,14 @@ wikipedia:
 # disabled by default so different Qwen sizes can be tested later.
 models:
   mgpt:
-    enabled: true
+    enabled: false
     model_name: ai-forever/mGPT
     model_type: causal_lm
     use_chat_template: false
     torch_dtype: float16
 
   bloom:
-    enabled: false
+    enabled: true
     model_name: bigscience/bloom-560m
     model_type: causal_lm
     use_chat_template: false

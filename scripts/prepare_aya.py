@@ -1,61 +1,113 @@
-
 #!/usr/bin/env python3
-"""Prepare the complete Aya inputs for the fixed 18-language experiment."""
+"""Prepare per-language CSV files from CohereLabs/aya_dataset."""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 from datasets import load_dataset
 
-LANGUAGES = ["ar", "bn", "en", "es", "eu", "fa", "fr", "hi", "id", "ml", "mr", "ne", "pt", "sw", "ta", "te", "ur", "vi"]
-LANGUAGE_NAMES = {
-    "ar":"Arabic","bn":"Bengali","en":"English","es":"Spanish","eu":"Basque","fa":"Persian",
-    "fr":"French","hi":"Hindi","id":"Indonesian","ml":"Malayalam","mr":"Marathi","ne":"Nepali",
-    "pt":"Portuguese","sw":"Swahili","ta":"Tamil","te":"Telugu","ur":"Urdu","vi":"Vietnamese"
-}
+from src.config import load_config
+
+
+# Dataset language codes (mostly ISO 639-3) -> project codes (ISO 639-1).
 AYA_CODE_TO_ISO1 = {
-    "arb":"ar","arz":"ar","ary":"ar","ars":"ar","ajp":"ar","acq":"ar","ara":"ar","ar":"ar",
-    "ben":"bn","bn":"bn","eng":"en","en":"en","spa":"es","es":"es","eus":"eu","baq":"eu","eu":"eu",
-    "pes":"fa","fas":"fa","per":"fa","fa":"fa","fra":"fr","fre":"fr","fr":"fr","hin":"hi","hi":"hi",
-    "ind":"id","id":"id","mal":"ml","ml":"ml","mar":"mr","mr":"mr","npi":"ne","nep":"ne","ne":"ne",
-    "por":"pt","pt":"pt","swh":"sw","swa":"sw","sw":"sw","tam":"ta","ta":"ta","tel":"te","te":"te",
-    "urd":"ur","ur":"ur","vie":"vi","vi":"vi"
+    "arb": "ar", "arz": "ar", "ary": "ar", "ars": "ar", "ajp": "ar",
+    "acq": "ar", "apc": "ar", "ara": "ar", "ar": "ar",
+    "ben": "bn", "bn": "bn", "eng": "en", "en": "en",
+    "spa": "es", "es": "es", "eus": "eu", "baq": "eu", "eu": "eu",
+    "pes": "fa", "fas": "fa", "per": "fa", "fa": "fa",
+    "fra": "fr", "fre": "fr", "fr": "fr", "hin": "hi", "hi": "hi",
+    "ind": "id", "id": "id", "mal": "ml", "ml": "ml", "mar": "mr", "mr": "mr",
+    "npi": "ne", "nep": "ne", "ne": "ne", "por": "pt", "pt": "pt",
+    "swh": "sw", "swa": "sw", "sw": "sw", "tam": "ta", "ta": "ta",
+    "tel": "te", "te": "te", "urd": "ur", "ur": "ur", "vie": "vi", "vi": "vi",
+    "zho": "zh", "chi": "zh", "cmn": "zh", "zh": "zh",
+    "jpn": "ja", "ja": "ja",
 }
 
 
-def main():
+def _map_aya_language_code(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    code = str(value).strip().lower()
+    mapped = AYA_CODE_TO_ISO1.get(code)
+    if mapped is not None:
+        return mapped
+    # For future languages, use ISO 639-3 -> ISO 639-1 conversion when available.
+    # The explicit map above remains necessary for dialect aliases and nonstandard codes.
+    try:
+        import pycountry
+
+        language = pycountry.languages.get(alpha_3=code)
+        if language is not None and hasattr(language, "alpha_2"):
+            return str(language.alpha_2)
+    except ImportError:
+        pass
+    return code if len(code) == 2 else None
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(ROOT / "configs" / "config.yaml"))
     parser.add_argument("--dataset", default="CohereLabs/aya_dataset")
-    parser.add_argument("--output-dir", default="data/aya_language_datasets")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    cfg = load_config(args.config)
+    languages = list(cfg["languages"])
+    language_names = cfg["language_names"]
+    output_dir = Path(args.output_dir or cfg["data"]["root_dir"])
+    if not output_dir.is_absolute():
+        output_dir = Path(cfg.get("_repo_root", ROOT)) / output_dir
+    seed = int(args.seed if args.seed is not None else cfg["data"].get("sampling_seed", cfg["project"].get("seed", 42)))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Loading {args.dataset} ...")
     aya = load_dataset(args.dataset, split="train")
-    cols = ["inputs", "targets", "language", "language_code"]
-    df = aya.select_columns(cols).to_pandas()
+    needed = ["inputs", "targets", "language", "language_code"]
+    missing = [column for column in needed if column not in aya.column_names]
+    if missing:
+        raise ValueError(f"Aya dataset is missing required columns: {missing}")
+    df = aya.select_columns(needed).to_pandas()
 
-    df["final_language_code"] = df["language_code"].apply(
-        lambda x: AYA_CODE_TO_ISO1.get(str(x).strip().lower()) if pd.notna(x) else None
-    )
-    df = df[df["final_language_code"].isin(LANGUAGES)].copy()
+    df["final_language_code"] = df["language_code"].apply(_map_aya_language_code)
+    df = df[df["final_language_code"].isin(languages)].copy()
 
-    for lang in LANGUAGES:
+    for lang in languages:
         language_df = df[df["final_language_code"] == lang].copy()
-        language_df = language_df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+        if language_df.empty:
+            raise RuntimeError(
+                f"Aya contains no rows for configured language {lang} ({language_names[lang]}). "
+                "Check the dataset language-code mapping and availability."
+            )
+        language_df = language_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
         language_df.insert(0, "sample_id", range(1, len(language_df) + 1))
-        language_df.insert(2, "main_language", LANGUAGE_NAMES[lang])
-        language_df = language_df[["sample_id","final_language_code","main_language","language","language_code","inputs","targets"]]
-        language_df.to_csv(out / f"{lang}.csv", index=False, encoding="utf-8-sig")
+        language_df.insert(2, "main_language", language_names[lang])
+        language_df = language_df[[
+            "sample_id", "final_language_code", "main_language", "language",
+            "language_code", "inputs", "targets",
+        ]]
+        language_df.to_csv(output_dir / f"{lang}.csv", index=False, encoding="utf-8-sig")
         print(f"{lang:>3} | {len(language_df):>8,}")
 
-    summary = pd.DataFrame([{"language_code": lang, "language": LANGUAGE_NAMES[lang], "num_samples": len(df[df["final_language_code"] == lang])} for lang in LANGUAGES])
-    summary.to_csv(out / "aya_language_dataset_summary.csv", index=False, encoding="utf-8-sig")
+    summary = pd.DataFrame([
+        {
+            "language_code": lang,
+            "language": language_names[lang],
+            "num_samples": int((df["final_language_code"] == lang).sum()),
+        }
+        for lang in languages
+    ])
+    summary.to_csv(output_dir / "aya_language_dataset_summary.csv", index=False, encoding="utf-8-sig")
     print(f"Total samples: {summary['num_samples'].sum():,}")
+    print(f"Saved per-language CSV files to: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":

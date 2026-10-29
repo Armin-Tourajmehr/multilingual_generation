@@ -4,6 +4,11 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 # Reduce CUDA allocator fragmentation on long-running Kaggle jobs.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -13,28 +18,44 @@ import torch
 
 from src.config import load_config
 from src.pipeline import run
+from src.smoke import build_smoke_config
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the GPU-only multilingual representation experiment.")
-    parser.add_argument("--config", default="configs/config.yaml")
+    parser = argparse.ArgumentParser(
+        description="Run the GPU-only multilingual representation experiment."
+    )
+    parser.add_argument("--config", default=str(ROOT / "configs" / "config.yaml"))
     parser.add_argument(
         "--pca-path",
         default=None,
-        help="Path where PCA layer files are stored/reused. Defaults to outputs/pca_data.",
+        help="Path where PCA layer files are stored/reused. Defaults to runtime.pca_data_path.",
     )
     parser.add_argument(
         "--force-refit-pca",
         action="store_true",
-        help="Recompute PCA even when a complete PCA directory already exists.",
+        help="Recompute PCA even when a matching PCA cache exists.",
     )
     parser.add_argument(
         "--force-refit-gmm",
         action="store_true",
-        help="Recompute Aya GMMs even when a complete saved fit exists.",
+        help="Recompute Aya GMMs even when a matching saved fit exists.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a limited end-to-end check (default: 5 Aya samples x 20 languages) in outputs/smoke_test.",
     )
     args = parser.parse_args()
     cfg = load_config(args.config)
+
+    if args.smoke_test:
+        cfg = build_smoke_config(cfg)
+        print("SMOKE TEST MODE: limited samples and isolated outputs are enabled.")
+        print(f"Sample cap per language: {cfg['data']['max_samples_per_language']}")
+        print(f"Wikipedia documents per language: {cfg['wikipedia']['max_samples_per_language']}")
+        print(f"PCA dimensions: {cfg['representation']['pca_dim']}")
+        print(f"Enabled smoke-test models: {[k for k, v in cfg['models'].items() if v.get('enabled')]}")
 
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -52,11 +73,16 @@ def main() -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     torch.set_grad_enabled(False)
+
+    pca_path = args.pca_path
+    if args.smoke_test:
+        # Always isolate smoke PCA data, even if a custom full-run --pca-path was supplied.
+        pca_path = cfg["runtime"]["pca_data_path"]
+
     run(
         cfg,
-        pca_path=args.pca_path or cfg["runtime"].get("pca_data_path"),
+        pca_path=pca_path or cfg["runtime"].get("pca_data_path"),
         force_refit_pca=args.force_refit_pca,
         force_refit_gmm=args.force_refit_gmm,
     )

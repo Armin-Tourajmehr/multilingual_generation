@@ -1,10 +1,7 @@
-# ============================================================
-# MAIN EXPERIMENT CONFIGURATION
-# Wikipedia -> GPU PCA fit -> full Aya GMM fit -> Aya generation/evaluation
-# ============================================================
-
+# Main experiment: Wikipedia -> GPU PCA -> Aya GMM -> generation analysis.
+# Models are run sequentially in the order listed below.
 project:
-  name: multilingual-representation-analysis-main
+  name: multilingual-representation-analysis
   seed: 42
 
 languages:
@@ -26,6 +23,8 @@ languages:
   - te
   - ur
   - vi
+  - zh
+  - ja
 
 language_names:
   ar: Arabic
@@ -46,12 +45,9 @@ language_names:
   te: Telugu
   ur: Urdu
   vi: Vietnamese
+  zh: Chinese
+  ja: Japanese
 
-# ------------------------------------------------------------
-# Aya evaluation data
-# ------------------------------------------------------------
-# All available Aya samples are used. GMMs are fitted on 100% of Aya
-# for each language. There is no train/test split.
 data:
   root_dir: data/aya_language_datasets
   input_column: inputs
@@ -60,11 +56,6 @@ data:
   max_samples_per_language: 2000
   sampling_seed: 42
 
-# ------------------------------------------------------------
-# Wikipedia reference data for PCA fitting only
-# ------------------------------------------------------------
-# Equal deterministic cap prevents high-resource languages from
-# dominating the shared representation reference space.
 wikipedia:
   dataset_name: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
   split: train
@@ -74,15 +65,11 @@ wikipedia:
   max_tokens_per_document: 128
   shuffle_buffer_size: 10000
 
-# ------------------------------------------------------------
-# Models
-# ------------------------------------------------------------
-# Enabled models run sequentially. Current main experiment:
-# mGPT + BLOOM. Qwen is reserved for future experiments and is
-# disabled by default so different Qwen sizes can be tested later.
+# Enabled models are processed sequentially. Large models are disabled by default
+# to keep the default Kaggle run memory-safe. Enable them explicitly on suitable GPUs.
 models:
   mgpt:
-    enabled: false
+    enabled: true
     model_name: ai-forever/mGPT
     model_type: causal_lm
     use_chat_template: false
@@ -103,19 +90,31 @@ models:
     chat_template_kwargs:
       enable_thinking: false
     torch_dtype: float16
+    # Conservative overrides if enabled on a sufficiently large GPU.
+    runtime_overrides:
+      wikipedia_batch_size: 1
+      evaluation_batch_size: 1
+      generation_batch_size: 1
+      max_input_tokens: 256
 
-# ------------------------------------------------------------
-# Aya generation
-# ------------------------------------------------------------
+  llama3_1_8b:
+    enabled: false
+    model_name: meta-llama/Llama-3.1-8B-Instruct
+    model_type: causal_lm
+    use_chat_template: true
+    torch_dtype: float16
+    runtime_overrides:
+      wikipedia_batch_size: 1
+      evaluation_batch_size: 1
+      generation_batch_size: 1
+      max_input_tokens: 256
+
 generation:
   max_new_tokens: 64
   do_sample: true
   temperature: 0.7
   top_p: 0.9
 
-# ------------------------------------------------------------
-# Representation
-# ------------------------------------------------------------
 representation:
   pca_dim: 700
   pca_solver: gpu_covariance
@@ -124,9 +123,6 @@ representation:
   gmm_reg_covar: 1.0e-6
   equal_language_priors: false
 
-# ------------------------------------------------------------
-# Runtime
-# ------------------------------------------------------------
 runtime:
   device: cuda
   require_gpu: true
@@ -134,19 +130,46 @@ runtime:
   low_cpu_mem_usage: true
   trust_remote_code: false
   mixed_precision: fp16
-  # Truncate long Aya inputs before the model forward/generation to keep a single T4 safe.
-  # This still processes 100% of Aya sample rows; only overlong prompts are truncated.
   max_input_tokens: 512
   generation_batch_size: 4
-  # GPU batch sizes. All representation/statistical tensor math is CUDA-only.
   wikipedia_batch_size: 8
   evaluation_batch_size: 8
-  # Path to the reusable PCA data. Relative paths are resolved from the repo root.
   pca_data_path: outputs/pca_data
 
-# ------------------------------------------------------------
-# Outputs
-# ------------------------------------------------------------
+# POS tags are aligned from Stanza word character spans to model-token offsets.
+# Missing Stanza resources are downloaded lazily when enabled; set this to false
+# on offline servers and pre-download models before the run.
+lexical_analysis:
+  enabled: true
+  strict: false
+  download_missing_models: true
+  stanza_model_dir: outputs/stanza_resources
+  save_pos_posterior_summary: true
+
+# This visualizes one GMM centroid per language in the PCA space for each layer.
+# It is a language-centroid manifold, not a plot of every token/sample.
+spectral_embedding:
+  enabled: true
+  n_components: 2
+  n_neighbors: 5
+  random_state: 42
+  affinity: nearest_neighbors
+
+smoke_test:
+  # With 20 configured languages, 5 rows/language gives at most 100 Aya rows.
+  samples_per_language: 5
+  wikipedia_samples_per_language: 10
+  pca_dim: 32
+  max_tokens_per_document: 48
+  max_input_tokens: 128
+  generation_max_new_tokens: 8
+  generation_batch_size: 1
+  wikipedia_batch_size: 1
+  evaluation_batch_size: 2
+  models: [bloom]
+  # Avoid unexpected downloads of up to 20 Stanza language packages during smoke tests.
+  download_stanza_models: false
+
 outputs:
   root_dir: outputs
   gmm_dir: aya_gmms

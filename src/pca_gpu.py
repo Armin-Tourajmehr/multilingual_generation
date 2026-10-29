@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 
@@ -11,14 +10,13 @@ import torch
 class GPUPCA:
     """PCA representation kept on CUDA.
 
-    Components are learned from the covariance of all reference token vectors:
+    Components are learned from covariance sufficient statistics:
         C = E[x x^T] - mu mu^T
-    The top eigenvectors of C are the PCA directions.
     """
 
-    mean: torch.Tensor          # [hidden_dim]
-    components: torch.Tensor   # [n_components, hidden_dim]
-    explained_variance: torch.Tensor  # [n_components]
+    mean: torch.Tensor
+    components: torch.Tensor
+    explained_variance: torch.Tensor
 
     @property
     def n_components(self) -> int:
@@ -39,6 +37,8 @@ class GPUPCA:
     def transform(self, X: torch.Tensor) -> torch.Tensor:
         if X.ndim != 2:
             raise ValueError(f"Expected [N, D] tensor, got shape {tuple(X.shape)}")
+        if X.shape[1] != self.hidden_dim:
+            raise ValueError(f"Expected hidden dimension {self.hidden_dim}, got {X.shape[1]}")
         Xf = X.float()
         return (Xf - self.mean) @ self.components.T
 
@@ -50,7 +50,7 @@ class GPUPCA:
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, torch.Tensor], device: torch.device) -> "GPUPCA":
+    def from_state_dict(cls, state: dict[str, torch.Tensor], device: torch.device | str) -> "GPUPCA":
         obj = cls(
             mean=state["mean"],
             components=state["components"],
@@ -92,7 +92,6 @@ class GPUPCACovarianceAccumulator:
             )
         mean = self.sum_x / float(self.count)
         covariance = self.sum_xx / float(self.count) - torch.outer(mean, mean)
-        # Numerical round-off may introduce tiny asymmetry/negative eigenvalues.
         covariance = (covariance + covariance.T) * 0.5
         eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
         top_values = eigenvalues[-n_components:].flip(0).clamp_min_(0.0)

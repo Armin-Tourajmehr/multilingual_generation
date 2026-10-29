@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import gc
+import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -30,9 +33,13 @@ from .modeling import (
     LoadedModel,
     forward_text_batch,
     generate_batch,
+    forward_generated_texts_with_context,
     load_model,
     release_model,
 )
+
+from .lexical import StanzaTagger, align_pos_to_token
+from .manifold import save_language_manifold
 
 from .pca_gpu import (
     GPUPCA,
@@ -76,6 +83,53 @@ class PartitionWriter:
     def close(self):
         if self.writer is not None:
             self.writer.close()
+
+
+def _model_revision(loaded: LoadedModel) -> str | None:
+    return getattr(getattr(loaded.model, "config", None), "_commit_hash", None)
+
+
+def _pca_fingerprint(cfg: dict[str, Any], loaded: LoadedModel) -> str:
+    payload = {
+        "model_key": loaded.name,
+        "model_name": loaded.spec.get("model_name"),
+        "model_revision": _model_revision(loaded),
+        "torch_dtype": loaded.spec.get("torch_dtype", "auto"),
+        "mixed_precision": cfg["runtime"].get("mixed_precision", "fp16"),
+        "trust_remote_code": bool(cfg["runtime"].get("trust_remote_code", False)),
+        "languages": list(cfg["languages"]),
+        "project_seed": int(cfg["project"].get("seed", 42)),
+        "pca_dim": int(cfg["representation"]["pca_dim"]),
+        "pca_solver": cfg["representation"].get("pca_solver"),
+        "wiki_dataset": cfg["wikipedia"].get("dataset_name"),
+        "wiki_split": cfg["wikipedia"].get("split", "train"),
+        "wiki_revision": cfg["wikipedia"].get("revision"),
+        "wiki_text_column": cfg["wikipedia"].get("text_column", "text"),
+        "wiki_sample_cap": int(cfg["wikipedia"]["max_samples_per_language"]),
+        "wiki_max_tokens": int(cfg["wikipedia"]["max_tokens_per_document"]),
+        "wiki_shuffle_buffer_size": int(cfg["wikipedia"].get("shuffle_buffer_size", 10000)),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _gmm_fingerprint(
+    cfg: dict[str, Any], loaded: LoadedModel, expected_sample_counts: dict[str, int]
+) -> str:
+    payload = {
+        "pca_fingerprint": _pca_fingerprint(cfg, loaded),
+        "languages": list(cfg["languages"]),
+        "aya_root": str(cfg["data"].get("root_dir")),
+        "input_column": cfg["data"].get("input_column"),
+        "sample_id_column": cfg["data"].get("sample_id_column"),
+        "aya_sample_cap": int(cfg["data"].get("max_samples_per_language", 2000)),
+        "sampling_seed": int(cfg["data"].get("sampling_seed", cfg["project"].get("seed", 42))),
+        "sample_counts": {k: int(v) for k, v in expected_sample_counts.items()},
+        "gmm_reg_covar": float(cfg["representation"].get("gmm_reg_covar", 1e-6)),
+        "prior_type": "empirical_sample_count",
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _language_batches(
@@ -222,6 +276,7 @@ def _fit_pca_on_wikipedia(
                 X = hidden[mask]
 
                 accumulators[layer].update(X)
+                del X
 
             del hidden_states, mask
 
@@ -271,6 +326,9 @@ def _fit_pca_on_wikipedia(
             "eigendecomposition on GPU"
         ),
         "pca_components": n_components,
+        "fingerprint": _pca_fingerprint(cfg, loaded),
+        "model_name": loaded.spec.get("model_name"),
+        "model_revision": _model_revision(loaded),
         "languages": list(
             cfg["languages"]
         ),
@@ -298,6 +356,10 @@ def _fit_pca_on_wikipedia(
             indent=2,
         )
 
+    # Remove stale layer files if a model/cache with a different layer count existed.
+    for old_path in model_pca_dir.glob("layer_*.pt"):
+        old_path.unlink()
+
     for layer, pca in enumerate(pcas):
 
         save_pca(
@@ -317,83 +379,40 @@ def _load_pcas_or_fit(
     pca_root: Path,
     force_refit: bool = False,
 ) -> list[GPUPCA]:
+    model_pca_dir = pca_root / loaded.name
+    paths = pca_paths(pca_root, loaded.name)
+    expected_layers = int(getattr(loaded.model.config, "num_hidden_layers")) + 1
+    metadata_path = model_pca_dir / "metadata.json"
+    expected_fingerprint = _pca_fingerprint(cfg, loaded)
 
-    model_pca_dir = (
-        pca_root / loaded.name
-    )
-
-    paths = pca_paths(
-        pca_root,
-        loaded.name,
-    )
-
-    expected_layers = (
-        int(
-            getattr(
-                loaded.model.config,
-                "num_hidden_layers",
+    if not force_refit and len(paths) == expected_layers and metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            cache_is_current = (
+                metadata.get("fingerprint") == expected_fingerprint
+                and metadata.get("languages") == list(cfg["languages"])
+                and int(metadata.get("pca_components", -1)) == int(cfg["representation"]["pca_dim"])
+                and metadata.get("model_name") == loaded.spec.get("model_name")
             )
-        )
-        + 1
-    )
-
-    if (
-        not force_refit
-        and len(paths) == expected_layers
-    ):
-
-        pcas = [
-            load_pca(
-                path,
-                loaded.device,
-            )
-            for path in paths
-        ]
-
-        pca_dim = int(
-            cfg["representation"][
-                "pca_dim"
-            ]
-        )
-
-        if any(
-            p.n_components != pca_dim
-            for p in pcas
-        ):
-            raise RuntimeError(
-                f"PCA files under "
-                f"{model_pca_dir} do not match "
-                f"pca_dim={pca_dim}."
-            )
-
+            if cache_is_current:
+                pcas = [load_pca(path, loaded.device) for path in paths]
+                pca_dim = int(cfg["representation"]["pca_dim"])
+                if all(p.n_components == pca_dim for p in pcas):
+                    print(f"[{loaded.name}] Reusing matching PCA data from: {model_pca_dir.resolve()}")
+                    return pcas
+                print(f"[{loaded.name}] Saved PCA dimensions do not match; rebuilding PCA.")
+            else:
+                print(f"[{loaded.name}] PCA cache is stale for the current model/languages/settings; rebuilding it.")
+        except Exception as exc:
+            print(f"[{loaded.name}] Could not validate PCA cache ({exc}); rebuilding it.")
+    elif paths and not force_refit:
         print(
-            f"[{loaded.name}] "
-            f"Reusing PCA data from: "
-            f"{model_pca_dir.resolve()}"
+            f"[{loaded.name}] PCA cache is incomplete or has no compatible metadata "
+            f"(found {len(paths)} layer files, expected {expected_layers}); rebuilding it."
         )
 
-        return pcas
-
-    if (
-        paths
-        and not force_refit
-        and len(paths) != expected_layers
-    ):
-
-        raise RuntimeError(
-            f"Incomplete PCA data under "
-            f"{model_pca_dir}: "
-            f"found {len(paths)} layer files, "
-            f"expected {expected_layers}. "
-            f"Use --force-refit-pca "
-            f"to rebuild it."
-        )
-
-    return _fit_pca_on_wikipedia(
-        cfg,
-        loaded,
-        pca_root,
-    )
+    return _fit_pca_on_wikipedia(cfg, loaded, pca_root)
 
 
 # ============================================================
@@ -533,6 +552,7 @@ def _fit_aya_gmms(
                     language_idx,
                     Z,
                 )
+                del X, Z
 
             del hidden_states, mask
 
@@ -727,6 +747,8 @@ def _fit_aya_gmms(
                 / loaded.name
             ).resolve()
         ),
+        "fingerprint": _gmm_fingerprint(cfg, loaded, expected_sample_counts),
+        "pca_fingerprint": _pca_fingerprint(cfg, loaded),
     }
 
     with (
@@ -851,6 +873,10 @@ def _load_gmms_or_fit(
                 )
                 == expected_counts
             )
+            same_fingerprint = (
+                meta.get("fingerprint")
+                == _gmm_fingerprint(cfg, loaded, expected_sample_counts)
+            )
 
             if (
                 same_pca
@@ -858,6 +884,7 @@ def _load_gmms_or_fit(
                 and same_coverage
                 and same_prior_type
                 and same_sample_counts
+                and same_fingerprint
             ):
 
                 print(
@@ -918,466 +945,233 @@ def _analyze_model(
     gmms: list[GPULanguageGMM],
     result_dir: Path,
 ):
-    result_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    """Generate text, then forward the exact decoded output for token/POS analysis."""
+    result_dir.mkdir(parents=True, exist_ok=True)
     gen_cfg = cfg["generation"]
+    batch_size = int(cfg["runtime"].get("generation_batch_size", 1))
+    languages = list(cfg["languages"])
+    posterior_columns = [f"P_{language}" for language in languages]
 
-    batch_size = int(
-        cfg["runtime"].get(
-            "generation_batch_size",
-            1,
-        )
-    )
+    token_writers: dict[str, PartitionWriter] = {}
+    sentence_writers: dict[str, PartitionWriter] = {}
+    output_writers: dict[str, PartitionWriter] = {}
+    counts = {lang: 0 for lang in languages}
 
-    token_writers: dict[
-        str,
-        PartitionWriter,
-    ] = {}
-
-    sentence_writers: dict[
-        str,
-        PartitionWriter,
-    ] = {}
-
-    output_writers: dict[
-        str,
-        PartitionWriter,
-    ] = {}
-
-    counts = {
-        lang: 0
-        for lang in cfg["languages"]
-    }
-
-    pcols = [
-        f"P_{x}"
-        for x in cfg["languages"]
-    ]
-
-    token_decode_cache: dict[
-        int,
-        str,
-    ] = {}
-
-    def decode_token(
-        token_id: int,
-    ) -> str:
-
-        token_id = int(
-            token_id
-        )
-
-        cached = (
-            token_decode_cache.get(
-                token_id
-            )
-        )
-
-        if cached is not None:
-            return cached
-
-        text = loaded.tokenizer.decode(
-            [token_id],
-            skip_special_tokens=False,
-        )
-
-        token_decode_cache[
-            token_id
-        ] = text
-
-        return text
+    lexical_cfg = dict(cfg.get("lexical_analysis", {}))
+    lexical_enabled = bool(lexical_cfg.get("enabled", True))
+    stanza_dir = Path(lexical_cfg.get("stanza_model_dir", "outputs/stanza_resources"))
+    if not stanza_dir.is_absolute():
+        stanza_dir = Path(cfg.get("_repo_root", Path.cwd())) / stanza_dir
+    lexical_cfg["stanza_model_dir"] = str(stanza_dir)
+    tagger = StanzaTagger(lexical_cfg) if lexical_enabled else None
 
     try:
+        print(f"[{loaded.name}] Aya pass 2/2: generation + token posterior/POS analysis")
 
-        print(
-            f"[{loaded.name}] "
-            f"Aya pass 2/2: "
-            f"generation + posterior analysis"
-        )
-
-        for language in cfg["languages"]:
+        for language in languages:
+            # Keep only small aggregates in memory; all token rows are streamed to Parquet.
+            pos_buckets: dict[tuple[int, str, str], dict[str, Any]] = {}
 
             for chunk in tqdm(
-                iter_aya_batches(
-                    cfg,
-                    language,
-                    batch_size,
-                ),
-                desc=(
-                    f"{loaded.name} "
-                    f"Aya/analysis/{language}"
-                ),
+                iter_aya_batches(cfg, language, batch_size),
+                desc=f"{loaded.name} Aya/analysis/{language}",
             ):
+                prompts = chunk[cfg["data"]["input_column"]].tolist()
+                sample_ids = chunk[cfg["data"]["sample_id_column"]].tolist()
 
-                prompts = chunk[
-                    cfg["data"][
-                        "input_column"
-                    ]
-                ].tolist()
-
-                sample_ids = chunk[
-                    cfg["data"][
-                        "sample_id_column"
-                    ]
-                ].tolist()
-
-                (
-                    token_ids,
-                    generated_texts,
-                    hidden_states,
-                    input_width,
-                ) = generate_batch(
-                    loaded,
-                    prompts,
-                    gen_cfg,
-                    cfg["runtime"],
+                generated_ids, generated_texts, _, prompt_token_ids = generate_batch(
+                    loaded, prompts, gen_cfg, cfg["runtime"]
                 )
-
-                # Count every source Aya row.
-                counts[
-                    language
-                ] += len(sample_ids)
-
-                max_generated = max(
-                    (
-                        len(ids)
-                        for ids in token_ids
-                    ),
-                    default=0,
-                )
-
-                if max_generated == 0:
-
-                    del hidden_states
-
-                    continue
-
-                length_tensor = torch.tensor(
-                    [
-                        len(ids)
-                        for ids in token_ids
-                    ],
-                    device=loaded.device,
-                    dtype=torch.long,
-                )
-
-                gen_positions = (
-                    torch.arange(
-                        max_generated,
-                        device=loaded.device,
-                    ).unsqueeze(0)
-                )
-
-                gen_mask = (
-                    gen_positions
-                    < length_tensor.unsqueeze(1)
-                )
-
-                # ------------------------------------------------
-                # Generated output rows
-                # ------------------------------------------------
-
+                counts[language] += len(sample_ids)
                 output_rows = [
                     {
                         "model": loaded.name,
                         "sample_id": sid,
                         "input_language": language,
                         "prompt": prompt,
-                        "generated_text": gen_text,
+                        "generated_text": text,
+                        "generated_token_count": len(ids),
                     }
-                    for sid, prompt, gen_text
-                    in zip(
-                        sample_ids,
-                        prompts,
-                        generated_texts,
-                    )
+                    for sid, prompt, text, ids in zip(sample_ids, prompts, generated_texts, generated_ids)
                 ]
+                outputs_path = result_dir / "generated_outputs" / f"{language}.parquet"
+                output_writers.setdefault(language, PartitionWriter(outputs_path)).write(output_rows)
 
-                token_rows_by_layer: dict[
-                    int,
-                    list[
-                        dict[str, Any]
-                    ],
-                ] = {
-                    i: []
-                    for i in range(
-                        len(pcas)
-                    )
-                }
+                # A separate teacher-forced forward pass gives each output token its own
+                # contextual hidden state; generation-time step states predict the next token.
+                hidden_states, output_token_ids, offsets, attention = forward_generated_texts_with_context(
+                    loaded,
+                    prompt_token_ids,
+                    generated_ids,
+                    generated_texts,
+                    cfg["runtime"],
+                )
 
-                sentence_rows: list[
-                    dict[str, Any]
-                ] = []
+                per_sample_refs: list[list[dict[str, Any]]] = []
+                for sample_idx, text in enumerate(generated_texts):
+                    if tagger is not None and text.strip():
+                        words, tag_status = tagger.tag_text(text, language)
+                    elif not lexical_enabled:
+                        words, tag_status = [], "disabled"
+                    else:
+                        words, tag_status = [], "empty"
 
-                # ------------------------------------------------
-                # PCA + GMM posterior
-                # ------------------------------------------------
-
-                for layer, (
-                    pca,
-                    gmm,
-                ) in enumerate(
-                    zip(
-                        pcas,
-                        gmms,
-                    )
-                ):
-
-                    # Hidden states for generated
-                    # tokens only.
-                    layer_hidden = (
-                        hidden_states[
-                            layer
-                        ][
-                            :,
-                            :max_generated,
-                            :,
-                        ]
-                    )
-
-                    valid_hidden = (
-                        layer_hidden[
-                            gen_mask
-                        ]
-                    )
-
-                    Z = pca.transform(
-                        valid_hidden
-                    )
-
-                    post = gmm.posterior(
-                        Z
-                    )
-
-                    post_cpu = (
-                        post
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    )
-
-                    offset = 0
-
-                    for sample_index, (
-                        sid,
-                        ids,
-                    ) in enumerate(
-                        zip(
-                            sample_ids,
-                            token_ids,
-                        )
+                    refs: list[dict[str, Any]] = []
+                    for seq_pos, (token_id, span, is_attended) in enumerate(
+                        zip(output_token_ids[sample_idx], offsets[sample_idx], attention[sample_idx])
                     ):
-
-                        sample_len = len(
-                            ids
-                        )
-
-                        if sample_len == 0:
+                        start_char, end_char = int(span[0]), int(span[1])
+                        if not is_attended or end_char <= start_char:
+                            continue  # padding/special tokens have no text span
+                        if start_char < 0 or end_char > len(text):
                             continue
+                        token_text = text[start_char:end_char]
+                        if not token_text or not token_text.strip():
+                            continue
+                        pos_info = align_pos_to_token(text, start_char, end_char, words, tag_status)
+                        try:
+                            model_token = loaded.tokenizer.convert_ids_to_tokens(int(token_id))
+                            if isinstance(model_token, list):
+                                model_token = "".join(str(x) for x in model_token)
+                        except Exception:
+                            model_token = loaded.tokenizer.decode([int(token_id)], skip_special_tokens=False)
+                        refs.append({
+                            "sample_index": sample_idx,
+                            "sequence_position": seq_pos,
+                            "token_id": int(token_id),
+                            "token": token_text,
+                            "model_token": str(model_token),
+                            "char_start": start_char,
+                            "char_end": end_char,
+                            **pos_info,
+                        })
+                    per_sample_refs.append(refs)
 
-                        sample_post = post[
-                            offset:
-                            offset + sample_len
-                        ]
+                sentence_rows: list[dict[str, Any]] = []
+                all_token_rows: list[dict[str, Any]] = []
+                n_layers = min(len(hidden_states), len(pcas), len(gmms))
 
-                        means = (
-                            sample_post
-                            .mean(dim=0)
-                            .detach()
-                            .cpu()
-                            .tolist()
-                        )
-
-                        sentence_rows.append(
-                            {
+                for layer in range(n_layers):
+                    flat_refs = [ref for refs in per_sample_refs for ref in refs]
+                    if not flat_refs:
+                        for sample_idx, (sid, _text) in enumerate(zip(sample_ids, generated_texts)):
+                            sentence_rows.append({
                                 "model": loaded.name,
                                 "sample_id": sid,
                                 "input_language": language,
                                 "layer": layer,
-                                **{
-                                    c: float(v)
-                                    for c, v in zip(
-                                        pcols,
-                                        means,
-                                    )
-                                },
-                            }
-                        )
+                                "num_output_tokens": 0,
+                                **{col: 0.0 for col in posterior_columns},
+                            })
+                        continue
 
-                        rows = (
-                            token_rows_by_layer[
-                                layer
-                            ]
-                        )
+                    vectors = torch.stack([
+                        hidden_states[layer][ref["sample_index"], ref["sequence_position"], :]
+                        for ref in flat_refs
+                    ])
+                    projected = pcas[layer].transform(vectors)
+                    # Bound temporary [N, language, PCA-dimension] posterior tensors.
+                    post_parts = [
+                        gmms[layer].posterior(projected[i:i + 512])
+                        for i in range(0, projected.shape[0], 512)
+                    ]
+                    posterior = torch.cat(post_parts, dim=0) if post_parts else projected.new_empty((0, len(languages)))
+                    post_values = posterior.detach().cpu().tolist()
+                    del vectors, projected, post_parts, posterior
 
-                        cpu_rows = (
-                            post_cpu[
-                                offset:
-                                offset
-                                + sample_len
-                            ]
-                        )
+                    sample_posteriors: list[list[list[float]]] = [[] for _ in sample_ids]
+                    for ref, values in zip(flat_refs, post_values):
+                        sample_idx = ref["sample_index"]
+                        row = {
+                            "model": loaded.name,
+                            "sample_id": sample_ids[sample_idx],
+                            "input_language": language,
+                            "token_position": len(sample_posteriors[sample_idx]),
+                            "sequence_position": ref["sequence_position"],
+                            "token": ref["token"],
+                            "model_token": ref["model_token"],
+                            "token_id": ref["token_id"],
+                            "char_start": ref["char_start"],
+                            "char_end": ref["char_end"],
+                            "word_text": ref["word_text"],
+                            "sentence_id": ref["sentence_id"],
+                            "word_id": ref["word_id"],
+                            "upos": ref["upos"],
+                            "xpos": ref["xpos"],
+                            "feats": ref["feats"],
+                            "pos_status": ref["pos_status"],
+                            "layer": layer,
+                        }
+                        row.update({col: float(value) for col, value in zip(posterior_columns, values)})
+                        sample_posteriors[sample_idx].append(values)
+                        all_token_rows.append(row)
 
-                        for position, (
-                            token_id,
-                            posterior_values,
-                        ) in enumerate(
-                            zip(
-                                ids,
-                                cpu_rows,
-                            )
-                        ):
+                        key = (layer, str(ref["upos"]), str(ref["pos_status"]))
+                        bucket = pos_buckets.setdefault(key, {"n": 0, "sums": {col: 0.0 for col in posterior_columns}})
+                        bucket["n"] += 1
+                        for col, value in zip(posterior_columns, values):
+                            bucket["sums"][col] += float(value)
 
-                            token_text = (
-                                decode_token(
-                                    int(
-                                        token_id
-                                    )
-                                )
-                            )
+                    for sample_idx, sid in enumerate(sample_ids):
+                        sample_values = sample_posteriors[sample_idx]
+                        if sample_values:
+                            n_values = len(sample_values)
+                            means = [sum(vals[j] for vals in sample_values) / n_values for j in range(len(languages))]
+                        else:
+                            n_values = 0
+                            means = [0.0] * len(languages)
+                        sentence_rows.append({
+                            "model": loaded.name,
+                            "sample_id": sid,
+                            "input_language": language,
+                            "layer": layer,
+                            "num_output_tokens": n_values,
+                            **{col: float(value) for col, value in zip(posterior_columns, means)},
+                        })
 
-                            row = {
-                                "model": loaded.name,
-                                "sample_id": sid,
-                                "input_language": language,
-                                "token_position": (
-                                    position
-                                ),
-                                "sequence_position": (
-                                    position
-                                ),
-                                "token": token_text,
-                                "token_id": int(
-                                    token_id
-                                ),
-                                "layer": layer,
-                            }
+                token_path = result_dir / "token_posteriors" / f"{language}.parquet"
+                token_writers.setdefault(language, PartitionWriter(token_path)).write(all_token_rows)
+                sentence_path = result_dir / "sentence_level_posteriors" / f"{language}.parquet"
+                sentence_writers.setdefault(language, PartitionWriter(sentence_path)).write(sentence_rows)
 
-                            row.update(
-                                {
-                                    c: float(v)
-                                    for c, v in zip(
-                                        pcols,
-                                        posterior_values,
-                                    )
-                                }
-                            )
+                del hidden_states, per_sample_refs, all_token_rows, sentence_rows
+                gc.collect()
 
-                            rows.append(row)
-
-                        offset += sample_len
-
-                # ------------------------------------------------
-                # Save generated outputs
-                # ------------------------------------------------
-
-                outputs_path = (
-                    result_dir
-                    / "generated_outputs"
-                    / f"{language}.parquet"
-                )
-
-                output_writers.setdefault(
-                    language,
-                    PartitionWriter(
-                        outputs_path
-                    ),
-                )
-
-                output_writers[
-                    language
-                ].write(
-                    output_rows
-                )
-
-                # ------------------------------------------------
-                # Save token posteriors
-                # ------------------------------------------------
-
-                token_path = (
-                    result_dir
-                    / "token_posteriors"
-                    / f"{language}.parquet"
-                )
-
-                token_writers.setdefault(
-                    language,
-                    PartitionWriter(
-                        token_path
-                    ),
-                )
-
-                for rows in (
-                    token_rows_by_layer.values()
-                ):
-
-                    token_writers[
-                        language
-                    ].write(rows)
-
-                # ------------------------------------------------
-                # Save sentence posteriors
-                # ------------------------------------------------
-
-                sentence_path = (
-                    result_dir
-                    / "sentence_level_posteriors"
-                    / f"{language}.parquet"
-                )
-
-                sentence_writers.setdefault(
-                    language,
-                    PartitionWriter(
-                        sentence_path
-                    ),
-                )
-
-                sentence_writers[
-                    language
-                ].write(
-                    sentence_rows
-                )
-
-                del (
-                    hidden_states,
-                    length_tensor,
-                    gen_positions,
-                    gen_mask,
-                )
+            # Small per-POS aggregation: average posterior probability for each candidate
+            # language by layer and Stanza UPOS tag. The detailed token rows remain in Parquet.
+            summary_rows: list[dict[str, Any]] = []
+            for (layer, upos, status), bucket in sorted(pos_buckets.items()):
+                n_tokens = int(bucket["n"])
+                for candidate_language in languages:
+                    col = f"P_{candidate_language}"
+                    summary_rows.append({
+                        "model": loaded.name,
+                        "input_language": language,
+                        "layer": layer,
+                        "upos": upos,
+                        "pos_status": status,
+                        "posterior_language": candidate_language,
+                        "num_tokens": n_tokens,
+                        "mean_posterior": bucket["sums"][col] / max(n_tokens, 1),
+                    })
+            summary_path = result_dir / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+            if tagger is not None:
+                # Only one source-language Stanza pipeline is retained at a time.
+                tagger.close()
 
     finally:
-
-        for writers in (
-            token_writers,
-            sentence_writers,
-            output_writers,
-        ):
-
-            for writer in (
-                writers.values()
-            ):
+        for writers in (token_writers, sentence_writers, output_writers):
+            for writer in writers.values():
                 writer.close()
+        if tagger is not None:
+            tagger.close()
 
-    # ------------------------------------------------------------
-    # Save analysis counts
-    # ------------------------------------------------------------
-
-    pd.DataFrame(
-        [
-            {
-                "language": lang,
-                "num_samples_analyzed": count,
-            }
-            for lang, count in counts.items()
-        ]
-    ).to_csv(
-        result_dir
-        / "analysis_counts.csv",
-        index=False,
-    )
+    pd.DataFrame([
+        {"language": lang, "num_samples_analyzed": count}
+        for lang, count in counts.items()
+    ]).to_csv(result_dir / "analysis_counts.csv", index=False)
 
 
 # ============================================================
@@ -1390,232 +1184,98 @@ def run(
     force_refit_pca: bool = False,
     force_refit_gmm: bool = False,
 ) -> None:
+    repo_root = Path(cfg.get("_repo_root", Path.cwd()))
+    output_root = Path(cfg["outputs"]["root_dir"])
+    if not output_root.is_absolute():
+        output_root = repo_root / output_root
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "manifests").mkdir(parents=True, exist_ok=True)
 
-    output_root = Path(
-        cfg["outputs"]["root_dir"]
-    )
-
-    output_root.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    (
-        output_root / "manifests"
-    ).mkdir(
-        exist_ok=True
-    )
-
-    # ---------------------------------------------------------
-    # Validate Aya
-    # ---------------------------------------------------------
-
-    validation = validate_aya_files(
-        cfg
-    )
-
-    validation.to_csv(
-        output_root
-        / "manifests"
-        / "aya_input_summary.csv",
-        index=False,
-    )
-
-    print(
-        "Aya input summary:"
-    )
-
-    print(
-        validation.to_string(
-            index=False
-        )
-    )
-
-    # ---------------------------------------------------------
-    # PCA root
-    # ---------------------------------------------------------
+    validation = validate_aya_files(cfg)
+    validation.to_csv(output_root / "manifests" / "aya_input_summary.csv", index=False)
+    print("Aya input summary:")
+    print(validation.to_string(index=False))
 
     default_pca_root = Path(
-        cfg["runtime"].get(
-            "pca_data_path"
-        )
-        or (
-            output_root
-            / "pca_data"
-        )
+        cfg["runtime"].get("pca_data_path") or (output_root / "pca_data")
     )
-
-    pca_root = (
-        Path(pca_path)
-        if pca_path is not None
-        else default_pca_root
-    )
-
+    pca_root = Path(pca_path) if pca_path is not None else default_pca_root
     if not pca_root.is_absolute():
+        pca_root = repo_root / pca_root
+    pca_root.mkdir(parents=True, exist_ok=True)
+    print(f"PCA data root: {pca_root.resolve()}")
 
-        pca_root = (
-            Path.cwd()
-            / pca_root
-        )
+    gmm_root = output_root / cfg["outputs"]["gmm_dir"]
+    expected_sample_counts = {
+        str(row.language): int(row.num_samples)
+        for row in validation.itertuples(index=False)
+    }
 
-    pca_root.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    enabled = [(key, spec) for key, spec in cfg["models"].items() if spec.get("enabled", False)]
+    if not enabled:
+        raise RuntimeError("No enabled models remain after configuration validation.")
 
-    print(
-        f"PCA data root: "
-        f"{pca_root.resolve()}"
-    )
+    # Sequential execution is intentional: one model is loaded, processed and released
+    # before the next model enters GPU memory.
+    for model_key, model_spec in enabled:
+        print("\n" + "=" * 90)
+        print(f"MODEL: {model_key} | {model_spec['model_name']}")
+        print("=" * 90)
 
-    # ---------------------------------------------------------
-    # GMM root
-    # ---------------------------------------------------------
+        model_cfg = deepcopy(cfg)
+        model_runtime = dict(cfg["runtime"])
+        model_runtime.update(model_spec.get("runtime_overrides", {}))
+        model_cfg["runtime"] = model_runtime
 
-    gmm_root = (
-        output_root
-        / cfg["outputs"]["gmm_dir"]
-    )
-
-    # ---------------------------------------------------------
-    # Run enabled models
-    # ---------------------------------------------------------
-
-    for model_key, model_spec in [
-        (k, v)
-        for k, v in cfg["models"].items()
-        if v.get("enabled", False)
-    ]:
-
-        print(
-            "\n"
-            + "=" * 90
-        )
-
-        print(
-            f"MODEL: {model_key} | "
-            f"{model_spec['model_name']}"
-        )
-
-        print(
-            "=" * 90
-        )
-
-        loaded = load_model(
-            model_key,
-            model_spec,
-            cfg["runtime"],
-        )
-
+        loaded = load_model(model_key, model_spec, model_runtime)
         try:
-
             print(
-                f"[{model_key}] "
-                f"GPU allocated after model load: "
+                f"[{model_key}] GPU allocated after model load: "
                 f"{torch.cuda.memory_allocated(loaded.device) / (1024**3):.2f} GiB"
             )
 
-            # -------------------------------------------------
-            # PCA
-            # -------------------------------------------------
-
             pcas = _load_pcas_or_fit(
-                cfg,
-                loaded,
-                pca_root,
-                force_refit=(
-                    force_refit_pca
-                ),
+                model_cfg, loaded, pca_root, force_refit=force_refit_pca
             )
-
-            # -------------------------------------------------
-            # Expected Aya sample counts
-            # -------------------------------------------------
-
-            expected_sample_counts = dict(
-                zip(
-                    validation["language"],
-                    validation[
-                        "num_samples"
-                    ],
-                )
-            )
-
-            # -------------------------------------------------
-            # GMM
-            # -------------------------------------------------
-
             gmms = _load_gmms_or_fit(
-                cfg,
+                model_cfg,
                 loaded,
                 pcas,
                 gmm_root,
                 pca_root,
                 expected_sample_counts,
-                force_refit=(
-                    force_refit_gmm
-                ),
+                force_refit=force_refit_gmm,
             )
 
-            # -------------------------------------------------
-            # Generation + analysis
-            # -------------------------------------------------
-
-            result_dir = (
-                output_root
-                / cfg["outputs"][
-                    "result_dir"
-                ]
-                / model_key
-            )
-
-            _analyze_model(
-                cfg,
-                loaded,
-                pcas,
-                gmms,
-                result_dir,
-            )
-
+            result_dir = output_root / cfg["outputs"]["result_dir"] / model_key
+            if model_cfg.get("spectral_embedding", {}).get("enabled", True):
+                try:
+                    save_language_manifold(
+                        gmms=gmms,
+                        languages=list(model_cfg["languages"]),
+                        language_names=model_cfg.get("language_names", {}),
+                        output_dir=result_dir / "manifold",
+                        cfg=model_cfg,
+                        model_name=loaded.name,
+                    )
+                except Exception as exc:
+                    err_path = result_dir / "manifold" / "error.txt"
+                    err_path.parent.mkdir(parents=True, exist_ok=True)
+                    err_path.write_text(
+                        f"Spectral Embedding failed: {type(exc).__name__}: {exc}\n",
+                        encoding="utf-8",
+                    )
+                    print(f"[{loaded.name}] WARNING: Spectral Embedding failed: {exc}")
+            _analyze_model(model_cfg, loaded, pcas, gmms, result_dir)
             del pcas, gmms
-
+            gc.collect()
         finally:
+            release_model(loaded)
 
-            release_model(
-                loaded
-            )
+    effective_cfg = json.loads(json.dumps(cfg))
+    effective_cfg.pop("_repo_root", None)
+    effective_cfg.setdefault("runtime", {})["pca_data_path"] = str(pca_root.resolve())
+    with (output_root / "run_config.json").open("w", encoding="utf-8") as f:
+        json.dump(effective_cfg, f, ensure_ascii=False, indent=2)
+    print("\nExperiment completed.")
 
-    # ---------------------------------------------------------
-    # Save effective configuration
-    # ---------------------------------------------------------
-
-    with (
-        output_root
-        / "run_config.json"
-    ).open(
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        effective_cfg = json.loads(
-            json.dumps(cfg)
-        )
-
-        effective_cfg.setdefault(
-            "runtime",
-        )[
-            "pca_data_path"
-        ] = str(
-            pca_root.resolve()
-        )
-
-        json.dump(
-            effective_cfg,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    print(
-        "\nExperiment completed."
-    )

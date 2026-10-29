@@ -1,33 +1,5 @@
-# Python
 __pycache__/
-*.py[cod]
-*.pyo
 .pytest_cache/
-.venv/
-venv/
-env/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Hugging Face / model caches
-.cache/
-.huggingface/
-transformers_cache/
-
-# Local data and experiment artifacts
-data/aya_language_datasets/*.csv
+*.py[cod]
+data/
 outputs/
-*.pkl
-*.pt
-*.bin
-*.safetensors
-*.parquet
-*.jsonl
-*.log
-.DS_Store
-Thumbs.db
-
-# Keep documentation placeholders
-!data/aya_language_datasets/README.md
-!outputs/README.md

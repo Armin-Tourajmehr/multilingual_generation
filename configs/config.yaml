@@ -158,8 +158,8 @@ spectral_embedding:
 smoke_test:
   # With 20 languages, 2 Aya rows/language gives at most 40 rows per model.
   # All four configured models are attempted sequentially.
-  samples_per_language: 100
-  wikipedia_samples_per_language: 100
+  samples_per_language: 2
+  wikipedia_samples_per_language: 2
   pca_dim: 16
   max_tokens_per_document: 32
   max_input_tokens: 64
@@ -170,7 +170,7 @@ smoke_test:
   models: [mgpt, bloom, qwen, llama3_1_8b]
   continue_on_model_error: true
   # Avoid unexpected downloads of up to 20 Stanza language packages during smoke tests.
-  download_stanza_models: false
+  download_stanza_models: true
 
 outputs:
   root_dir: outputs

@@ -44,7 +44,7 @@ def main() -> None:
     parser.add_argument(
         "--smoke-test",
         action="store_true",
-        help="Run a limited end-to-end check (default: 5 Aya samples x 20 languages) in outputs/smoke_test.",
+        help="Run all configured smoke models with 2 Aya samples x 20 languages (40 max/model) in outputs/smoke_test; model errors are logged and the next model is attempted.",
     )
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -56,6 +56,7 @@ def main() -> None:
         print(f"Wikipedia documents per language: {cfg['wikipedia']['max_samples_per_language']}")
         print(f"PCA dimensions: {cfg['representation']['pca_dim']}")
         print(f"Enabled smoke-test models: {[k for k, v in cfg['models'].items() if v.get('enabled')]}")
+        print(f"Continue to next model after a model error: {cfg.get('smoke_test', {}).get('continue_on_model_error', False)}")
 
     if not torch.cuda.is_available():
         raise RuntimeError(

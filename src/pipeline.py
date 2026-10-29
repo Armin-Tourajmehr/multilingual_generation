@@ -1216,7 +1216,11 @@ def run(
         raise RuntimeError("No enabled models remain after configuration validation.")
 
     # Sequential execution is intentional: one model is loaded, processed and released
-    # before the next model enters GPU memory.
+    # before the next model enters GPU memory. Smoke mode can continue after an individual
+    # model fails (e.g. a model does not fit in available VRAM); the full run remains strict.
+    smoke_continue = bool(cfg.get("smoke_test", {}).get("continue_on_model_error", False))
+    model_errors: list[dict[str, str]] = []
+
     for model_key, model_spec in enabled:
         print("\n" + "=" * 90)
         print(f"MODEL: {model_key} | {model_spec['model_name']}")
@@ -1226,9 +1230,10 @@ def run(
         model_runtime = dict(cfg["runtime"])
         model_runtime.update(model_spec.get("runtime_overrides", {}))
         model_cfg["runtime"] = model_runtime
+        loaded = None
 
-        loaded = load_model(model_key, model_spec, model_runtime)
         try:
+            loaded = load_model(model_key, model_spec, model_runtime)
             print(
                 f"[{model_key}] GPU allocated after model load: "
                 f"{torch.cuda.memory_allocated(loaded.device) / (1024**3):.2f} GiB"
@@ -1269,8 +1274,33 @@ def run(
             _analyze_model(model_cfg, loaded, pcas, gmms, result_dir)
             del pcas, gmms
             gc.collect()
+        except Exception as exc:
+            if not smoke_continue:
+                raise
+            message = f"{type(exc).__name__}: {exc}"
+            print(f"[{model_key}] SMOKE TEST ERROR; continuing to next model: {message}")
+            model_errors.append({"model": model_key, "error": message})
+            # Release partial allocations after model-load/PCA/GMM failures.
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            gc.collect()
         finally:
-            release_model(loaded)
+            if loaded is not None:
+                try:
+                    release_model(loaded)
+                except Exception as cleanup_exc:
+                    print(f"[{model_key}] WARNING: cleanup failed: {cleanup_exc}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+    if model_errors:
+        errors_path = output_root / "manifests" / "smoke_model_errors.json"
+        with errors_path.open("w", encoding="utf-8") as f:
+            json.dump(model_errors, f, ensure_ascii=False, indent=2)
+        print(f"Smoke-test model errors saved to: {errors_path}")
 
     effective_cfg = json.loads(json.dumps(cfg))
     effective_cfg.pop("_repo_root", None)

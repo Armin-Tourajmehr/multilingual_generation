@@ -24,7 +24,7 @@ The script writes one CSV per configured language under `data/aya_language_datas
 python scripts/run_experiment.py --config configs/config.yaml
 ```
 
-Models run sequentially in the order listed in `configs/config.yaml`. `mgpt` and `bloom` are enabled initially. `qwen` (Qwen3-8B) and `llama3_1_8b` (Llama 3.1 8B Instruct) are present but disabled by default because they need substantially more GPU memory. Set `enabled: true` for a model to include it. Llama access may require accepting Meta's license and authenticating with Hugging Face on the target server.
+All four models (`mgpt`, `bloom`, `qwen`, and `llama3_1_8b`) are enabled in the current configuration and run sequentially in YAML order. Qwen3-8B and Llama 3.1 8B Instruct require substantially more GPU memory and may fail to load on a 16 GiB GPU. Llama access may require accepting Meta's license and authenticating with Hugging Face on the target server. For the full experiment, a model error stops the run; disable models that do not fit by setting `enabled: false`.
 
 Large-model settings have conservative per-model batch-size overrides. They do not guarantee that an 8B model will fit on every GPU; hardware capacity still matters. The PCA method retains GPU covariance statistics for all layers, so large hidden sizes add a noticeable GPU-memory requirement.
 
@@ -34,7 +34,7 @@ Large-model settings have conservative per-model batch-size overrides. They do n
 python scripts/run_experiment.py --config configs/config.yaml --smoke-test
 ```
 
-This runs an end-to-end, limited test with BLOOM by default, up to five Aya rows per language (100 rows for the current 20 languages), 10 Wikipedia documents per language, 32 PCA components and eight generated tokens. It writes into `outputs/smoke_test/` and does not overwrite the full-run PCA/GMM cache under `outputs/pca_data/` and `outputs/aya_gmms/`.
+This attempts all four models sequentially. It uses up to two Aya rows per language (40 rows per model across the current 20 languages), two Wikipedia documents per language, 16 PCA components, short input contexts and four generated tokens. It writes into `outputs/smoke_test/` and does not overwrite the full-run PCA/GMM cache under `outputs/pca_data/` and `outputs/aya_gmms/`. If an individual model fails (including out-of-memory or gated model access), smoke mode logs the error to `outputs/smoke_test/manifests/smoke_model_errors.json` and continues to the next model. Successful models' outputs remain available.
 
 The smoke test avoids automatic Stanza downloads so it does not unexpectedly download 20 language packages. If the Stanza resources are not already installed, token rows clearly report `POS_UNAVAILABLE`; the rest of the end-to-end run can still be checked. For the full run, `lexical_analysis.download_missing_models: true` downloads missing tokenizer/POS resources on first use. On an offline server, download the Stanza resources in advance or set that option to false.
 

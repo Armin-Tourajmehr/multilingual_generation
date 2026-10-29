@@ -17,8 +17,8 @@ def test_main_config_has_dynamic_language_and_model_lists():
     assert set(cfg["languages"]) == set(cfg["language_names"])
     assert cfg["models"]["mgpt"]["enabled"] is True
     assert cfg["models"]["bloom"]["enabled"] is True
-    assert cfg["models"]["qwen"]["enabled"] is False
-    assert cfg["models"]["llama3_1_8b"]["enabled"] is False
+    assert cfg["models"]["qwen"]["enabled"] is True
+    assert cfg["models"]["llama3_1_8b"]["enabled"] is True
     assert cfg["representation"]["pca_solver"] == "gpu_covariance"
     assert cfg["runtime"]["pca_data_path"] == "outputs/pca_data"
     assert cfg["outputs"]["gmm_dir"] == "aya_gmms"
@@ -40,13 +40,19 @@ def test_runtime_configuration_and_model_overrides():
 def test_smoke_config_isolated_and_small():
     cfg = load_config(ROOT / "configs" / "config.yaml")
     smoke_cfg = build_smoke_config(cfg)
-    assert smoke_cfg["data"]["max_samples_per_language"] == 5
-    assert smoke_cfg["wikipedia"]["max_samples_per_language"] == 10
-    assert smoke_cfg["representation"]["pca_dim"] == 32
-    assert smoke_cfg["generation"]["max_new_tokens"] == 8
+    assert smoke_cfg["data"]["max_samples_per_language"] == 2
+    assert len(smoke_cfg["languages"]) * smoke_cfg["data"]["max_samples_per_language"] == 40
+    assert smoke_cfg["wikipedia"]["max_samples_per_language"] == 2
+    assert smoke_cfg["representation"]["pca_dim"] == 16
+    assert smoke_cfg["generation"]["max_new_tokens"] == 4
     assert smoke_cfg["outputs"]["root_dir"] == "outputs/smoke_test"
     assert smoke_cfg["runtime"]["pca_data_path"] == "outputs/smoke_test/pca_data"
-    assert [k for k, v in smoke_cfg["models"].items() if v["enabled"]] == ["bloom"]
+    assert [k for k, v in smoke_cfg["models"].items() if v["enabled"]] == [
+        "mgpt", "bloom", "qwen", "llama3_1_8b"
+    ]
+    assert smoke_cfg["smoke_test"]["continue_on_model_error"] is True
+    for model_key in ("qwen", "llama3_1_8b"):
+        assert smoke_cfg["models"][model_key]["runtime_overrides"]["max_input_tokens"] == 64
     # Building a smoke config must not mutate the main config.
     assert cfg["data"]["max_samples_per_language"] == 2000
     assert cfg["representation"]["pca_dim"] == 700

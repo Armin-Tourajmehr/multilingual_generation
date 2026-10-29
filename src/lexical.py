@@ -79,28 +79,149 @@ class StanzaTagger:
             if self.cfg.get("strict", False):
                 raise RuntimeError(f"Stanza failed for language {language}: {exc}") from exc
             return [], "error"
-
         words: list[dict[str, Any]] = []
         search_cursor = 0
+
         for sent_idx, sentence in enumerate(doc.sentences):
-            for word_idx, word in enumerate(sentence.words):
-                word_text = str(getattr(word, "text", ""))
-                start = getattr(word, "start_char", None)
-                end = getattr(word, "end_char", None)
-                if start is None or end is None:
-                    start, end = _find_span(text, word_text, search_cursor)
-                if start is not None and end is not None and end > start:
-                    search_cursor = int(end)
-                words.append({
-                    "sentence_id": sent_idx,
-                    "word_id": word_idx,
-                    "word_text": word_text,
-                    "char_start": int(start) if start is not None else -1,
-                    "char_end": int(end) if end is not None else -1,
-                    "upos": str(getattr(word, "upos", None) or "X"),
-                    "xpos": str(getattr(word, "xpos", None) or ""),
-                    "feats": str(getattr(word, "feats", None) or ""),
-                })
+            word_idx = 0
+
+            # Keep the original surface-token offsets. A Stanza Word created
+            # by MWT expansion may not exist literally in the original text.
+            for token in sentence.tokens:
+                token_start = getattr(token, "start_char", None)
+                token_end = getattr(token, "end_char", None)
+
+                try:
+                    token_start = (
+                        int(token_start)
+                        if token_start is not None
+                        else -1
+                    )
+                    token_end = (
+                        int(token_end)
+                        if token_end is not None
+                        else -1
+                    )
+                except (TypeError, ValueError):
+                    token_start, token_end = -1, -1
+
+                token_has_span = (
+                    token_start >= 0 and token_end > token_start
+                )
+                token_cursor = (
+                    token_start if token_has_span else search_cursor
+                )
+
+                token_words = list(getattr(token, "words", []) or [])
+
+                for local_idx, word in enumerate(token_words):
+                    word_text = str(getattr(word, "text", ""))
+
+                    start = getattr(word, "start_char", None)
+                    end = getattr(word, "end_char", None)
+
+                    try:
+                        start = int(start) if start is not None else -1
+                        end = int(end) if end is not None else -1
+                    except (TypeError, ValueError):
+                        start, end = -1, -1
+
+                    valid_span = start >= 0 and end > start
+
+                    # First try Stanza's original word offsets.
+                    if not valid_span and token_has_span and word_text:
+                        search_from = max(token_start, token_cursor)
+                        found = text.find(
+                            word_text,
+                            search_from,
+                            token_end,
+                        )
+
+                        if (
+                            found >= 0
+                            and found + len(word_text) <= token_end
+                        ):
+                            start = found
+                            end = found + len(word_text)
+                            valid_span = True
+
+                    # MWT-expanded text may not occur literally in the
+                    # source. Use the remaining parent-token span, stopping
+                    # at the next valid child-word boundary when available.
+                    if not valid_span and token_has_span:
+                        search_from = max(token_start, token_cursor)
+                        next_start = None
+
+                        for future in token_words[local_idx + 1:]:
+                            future_start = getattr(
+                                future, "start_char", None
+                            )
+                            future_end = getattr(
+                                future, "end_char", None
+                            )
+
+                            try:
+                                future_start = (
+                                    int(future_start)
+                                    if future_start is not None
+                                    else -1
+                                )
+                                future_end = (
+                                    int(future_end)
+                                    if future_end is not None
+                                    else -1
+                                )
+                            except (TypeError, ValueError):
+                                continue
+
+                            if (
+                                future_start >= search_from
+                                and future_end > future_start
+                                and future_start < token_end
+                            ):
+                                next_start = future_start
+                                break
+
+                        approximate_end = (
+                            next_start
+                            if next_start is not None
+                            else token_end
+                        )
+
+                        if approximate_end > search_from:
+                            start = search_from
+                            end = approximate_end
+                            valid_span = True
+
+                    # Last fallback for words without a usable parent span.
+                    if not valid_span:
+                        start, end = _find_span(
+                            text, word_text, search_cursor
+                        )
+
+                    if start >= 0 and end > start:
+                        token_cursor = max(token_cursor, end)
+                        search_cursor = max(search_cursor, end)
+
+                    words.append({
+                        "sentence_id": sent_idx,
+                        "word_id": word_idx,
+                        "word_text": word_text,
+                        "char_start": start if start >= 0 else -1,
+                        "char_end": end if end > start else -1,
+                        "upos": str(
+                            getattr(word, "upos", None) or "X"
+                        ),
+                        "xpos": str(
+                            getattr(word, "xpos", None) or ""
+                        ),
+                        "feats": str(
+                            getattr(word, "feats", None) or ""
+                        ),
+                    })
+
+                    word_idx += 1
+
         return words, "ok"
 
     def close(self) -> None:

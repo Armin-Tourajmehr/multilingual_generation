@@ -44,7 +44,10 @@ def test_smoke_config_isolated_and_small():
     assert len(smoke_cfg["languages"]) * smoke_cfg["data"]["max_samples_per_language"] == 40
     assert smoke_cfg["wikipedia"]["max_samples_per_language"] == 2
     assert smoke_cfg["representation"]["pca_dim"] == 16
-    assert smoke_cfg["generation"]["max_new_tokens"] == 4
+    assert (
+        smoke_cfg["generation"]["max_new_tokens"]
+        == cfg["smoke_test"]["generation_max_new_tokens"]
+    )
     assert smoke_cfg["outputs"]["root_dir"] == "outputs/smoke_test"
     assert smoke_cfg["runtime"]["pca_data_path"] == "outputs/smoke_test/pca_data"
     assert [k for k, v in smoke_cfg["models"].items() if v["enabled"]] == [

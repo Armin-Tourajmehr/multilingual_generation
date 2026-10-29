@@ -22,32 +22,34 @@ class StanzaTagger:
             try:
                 import stanza
             except ImportError as exc:
-                raise RuntimeError("The 'stanza' package is not installed. Install requirements.txt.") from exc
+                raise RuntimeError(
+                    "The 'stanza' package is not installed. "
+                    "Install requirements.txt."
+                ) from exc
             self._stanza = stanza
+
+        self._model_dir.mkdir(parents=True, exist_ok=True)
+
+        allow_download = bool(
+            self.cfg.get("download_missing_models", False)
+        )
 
         kwargs = {
             "lang": language,
-            "processors": "tokenize,pos",
+            "processors": {
+                "tokenize": "default",
+                "pos": "default",
+            },
+            "package": None,
             "dir": str(self._model_dir),
             "use_gpu": False,
             "verbose": False,
-            "download_method": None,
+            "download_method": (
+                "reuse_resources" if allow_download else None
+            ),
         }
-        try:
-            return self._stanza.Pipeline(**kwargs)
-        except Exception as first_error:
-            if not self.cfg.get("download_missing_models", False):
-                raise first_error
-            self._model_dir.mkdir(parents=True, exist_ok=True)
-            # Explicit processor package selection avoids downloading unrelated
-            # dependency, NER and sentiment models.
-            self._stanza.download(
-                lang=language,
-                model_dir=str(self._model_dir),
-                processors={"tokenize": "default", "pos": "default"},
-                verbose=False,
-            )
-            return self._stanza.Pipeline(**kwargs)
+
+        return self._stanza.Pipeline(**kwargs)
 
     def _ensure_pipeline(self, language: str):
         if self._language == language and self._pipe is not None:

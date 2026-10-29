@@ -163,7 +163,7 @@ smoke_test:
   pca_dim: 16
   max_tokens_per_document: 32
   max_input_tokens: 64
-  generation_max_new_tokens: 4
+  generation_max_new_tokens: 32
   generation_batch_size: 1
   wikipedia_batch_size: 1
   evaluation_batch_size: 1

@@ -16,17 +16,37 @@ from src.config import load_config
 
 
 # Dataset language codes (mostly ISO 639-3) -> project codes (ISO 639-1).
+# Only Standard Arabic (arb) is allowed to map to project language "ar".
+STRICT_ARABIC_CODE = "arb"
+
+# Other Arabic varieties and the Arabic macrolanguage are excluded.
+EXCLUDED_ARABIC_CODES = {
+    "ar", "ara",
+    "arz", "ary", "ars",
+    "ajp", "acq", "apc",
+    "aeb", "acm",
+}
+
+# Dataset language codes -> project language codes.
+# Arabic is deliberately excluded from this general mapping.
 AYA_CODE_TO_ISO1 = {
-    "arb": "ar", "arz": "ar", "ary": "ar", "ars": "ar", "ajp": "ar",
-    "acq": "ar", "apc": "ar", "ara": "ar", "ar": "ar",
-    "ben": "bn", "bn": "bn", "eng": "en", "en": "en",
-    "spa": "es", "es": "es", "eus": "eu", "baq": "eu", "eu": "eu",
+    "ben": "bn", "bn": "bn",
+    "eng": "en", "en": "en",
+    "spa": "es", "es": "es",
+    "eus": "eu", "baq": "eu", "eu": "eu",
     "pes": "fa", "fas": "fa", "per": "fa", "fa": "fa",
-    "fra": "fr", "fre": "fr", "fr": "fr", "hin": "hi", "hi": "hi",
-    "ind": "id", "id": "id", "mal": "ml", "ml": "ml", "mar": "mr", "mr": "mr",
-    "npi": "ne", "nep": "ne", "ne": "ne", "por": "pt", "pt": "pt",
-    "swh": "sw", "swa": "sw", "sw": "sw", "tam": "ta", "ta": "ta",
-    "tel": "te", "te": "te", "urd": "ur", "ur": "ur", "vie": "vi", "vi": "vi",
+    "fra": "fr", "fre": "fr", "fr": "fr",
+    "hin": "hi", "hi": "hi",
+    "ind": "id", "id": "id",
+    "mal": "ml", "ml": "ml",
+    "mar": "mr", "mr": "mr",
+    "npi": "ne", "nep": "ne", "ne": "ne",
+    "por": "pt", "pt": "pt",
+    "swh": "sw", "swa": "sw", "sw": "sw",
+    "tam": "ta", "ta": "ta",
+    "tel": "te", "te": "te",
+    "urd": "ur", "ur": "ur",
+    "vie": "vi", "vi": "vi",
     "zho": "zh", "chi": "zh", "cmn": "zh", "zh": "zh",
     "jpn": "ja", "ja": "ja",
 }
@@ -35,21 +55,45 @@ AYA_CODE_TO_ISO1 = {
 def _map_aya_language_code(value: object) -> str | None:
     if pd.isna(value):
         return None
+
     code = str(value).strip().lower()
+
+    # Strict Arabic rule: only Standard Arabic is accepted.
+    if code == STRICT_ARABIC_CODE:
+        return "ar"
+
+    # Explicitly reject Arabic dialects and the Arabic macrolanguage.
+    if code in EXCLUDED_ARABIC_CODES:
+        return None
+
     mapped = AYA_CODE_TO_ISO1.get(code)
+
     if mapped is not None:
         return mapped
-    # For future languages, use ISO 639-3 -> ISO 639-1 conversion when available.
-    # The explicit map above remains necessary for dialect aliases and nonstandard codes.
+
+    # Fallback for other languages only.
     try:
         import pycountry
 
         language = pycountry.languages.get(alpha_3=code)
+
         if language is not None and hasattr(language, "alpha_2"):
-            return str(language.alpha_2)
+            alpha_2 = str(language.alpha_2)
+
+            # Never let the fallback map another code to Arabic.
+            if alpha_2 == "ar":
+                return None
+
+            return alpha_2
+
     except ImportError:
         pass
-    return code if len(code) == 2 else None
+
+    # Two-letter fallback, explicitly excluding Arabic.
+    if len(code) == 2 and code != "ar":
+        return code
+
+    return None
 
 
 def main() -> None:
@@ -78,6 +122,43 @@ def main() -> None:
     df = aya.select_columns(needed).to_pandas()
 
     df["final_language_code"] = df["language_code"].apply(_map_aya_language_code)
+    # Audit Arabic source codes before filtering.
+    print("\nArabic source-code audit:")
+
+    raw_codes = (
+        df["language_code"]
+        .astype("string")
+        .str.strip()
+        .str.lower()
+    )
+
+    arabic_audit = raw_codes[
+        raw_codes.isin(EXCLUDED_ARABIC_CODES | {STRICT_ARABIC_CODE})
+    ].value_counts()
+
+    print(arabic_audit.to_string())
+
+    # Only arb is permitted to produce project language "ar".
+    selected_arabic = df[df["final_language_code"] == "ar"].copy()
+
+    if not selected_arabic.empty:
+        selected_codes = set(
+            selected_arabic["language_code"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+
+        if selected_codes != {"arb"}:
+            raise RuntimeError(
+                f"Arabic filtering failed. Unexpected source codes: {selected_codes}"
+            )
+
+    print(
+        f"\nStandard Arabic (arb) selected: "
+        f"{len(selected_arabic):,} samples"
+    )
+
     df = df[df["final_language_code"].isin(languages)].copy()
 
     for lang in languages:

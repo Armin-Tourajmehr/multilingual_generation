@@ -241,6 +241,17 @@ def _generate_on_device(
         "pad_token_id": loaded.tokenizer.pad_token_id,
         "use_cache": True,
     }
+    min_new_tokens = generation.get("min_new_tokens")
+
+    if min_new_tokens is not None:
+        min_new_tokens = int(min_new_tokens)
+
+        if not 0 <= min_new_tokens <= int(generation["max_new_tokens"]):
+            raise ValueError(
+                "min_new_tokens must be between 0 and max_new_tokens."
+            )
+
+    kwargs["min_new_tokens"] = min_new_tokens
     if do_sample:
         kwargs["temperature"] = float(generation.get("temperature", 0.7))
         kwargs["top_p"] = float(generation.get("top_p", 0.9))

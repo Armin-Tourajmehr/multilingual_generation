@@ -83,7 +83,7 @@ models:
     torch_dtype: float16
 
   qwen:
-    enabled: true
+    enabled: false
     model_name: Qwen/Qwen3-8B
     model_type: causal_lm
     use_chat_template: true

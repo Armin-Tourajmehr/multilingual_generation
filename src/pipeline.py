@@ -43,6 +43,7 @@ from .modeling import (
 
 from .lexical import StanzaTagger, align_pos_to_token
 from .manifold import save_language_manifold
+from .token_alignment import tokenizer_special_ids
 
 from .pca_gpu import (
     GPUPCA,
@@ -1032,7 +1033,7 @@ def _analyze_model(
     gmms: list[GPULanguageGMM],
     result_dir: Path,
 ):
-    """Generate text, then forward the exact decoded output for token/POS analysis."""
+    """Replay generated IDs for post-emission states and attach optional POS spans."""
     result_dir.mkdir(parents=True, exist_ok=True)
     gen_cfg = cfg["generation"]
     batch_size = int(cfg["runtime"].get("generation_batch_size", 1))
@@ -1041,6 +1042,7 @@ def _analyze_model(
     batches_processed = 0
     languages = list(cfg["languages"])
     posterior_columns = [f"P_{language}" for language in languages]
+    special_ids = tokenizer_special_ids(loaded.tokenizer)
 
     token_writers: dict[str, PartitionWriter] = {}
     sentence_writers: dict[str, PartitionWriter] = {}
@@ -1089,6 +1091,11 @@ def _analyze_model(
                     "generated_text": generated_texts,
                     "generated_token_count": [len(ids) for ids in generated_ids],
                 })
+                output_table = output_table.append_column(
+                    "generated_token_ids", pa.array(generated_ids, type=pa.list_(pa.int64()))
+                ).append_column(
+                    "prompt_token_ids", pa.array(prompt_token_ids, type=pa.list_(pa.int64()))
+                )
                 outputs_path = result_dir / "generated_outputs" / f"{language}.parquet"
                 output_writers.setdefault(language, PartitionWriter(outputs_path)).write_table(output_table)
 
@@ -1117,25 +1124,24 @@ def _analyze_model(
                     for seq_pos, (token_id, span, is_attended) in enumerate(
                         zip(output_token_ids[sample_idx], offsets[sample_idx], attention[sample_idx])
                     ):
+                        token_id = int(token_id)
+                        if not is_attended or token_id in special_ids:
+                            continue
                         start_char, end_char = int(span[0]), int(span[1])
-                        if not is_attended or end_char <= start_char:
-                            continue  # padding/special tokens have no text span
-                        if start_char < 0 or end_char > len(text):
-                            continue
+                        if not 0 <= start_char < end_char <= len(text):
+                            start_char = end_char = 0
                         token_text = text[start_char:end_char]
-                        if not token_text or not token_text.strip():
-                            continue
                         pos_info = align_pos_to_token(text, start_char, end_char, words, tag_status)
                         try:
-                            model_token = loaded.tokenizer.convert_ids_to_tokens(int(token_id))
+                            model_token = loaded.tokenizer.convert_ids_to_tokens(token_id)
                             if isinstance(model_token, list):
                                 model_token = "".join(str(x) for x in model_token)
                         except Exception:
-                            model_token = loaded.tokenizer.decode([int(token_id)], skip_special_tokens=False)
+                            model_token = loaded.tokenizer.decode([token_id], skip_special_tokens=False)
                         refs.append({
                             "sample_index": sample_idx,
                             "sequence_position": seq_pos,
-                            "token_id": int(token_id),
+                            "token_id": token_id,
                             "token": token_text,
                             "model_token": str(model_token),
                             "char_start": start_char,

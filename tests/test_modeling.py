@@ -11,9 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import (
     BloomConfig, BloomForCausalLM, GPT2Config, GPT2LMHeadModel,
-    LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM,
+    LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM,
 )
 
 from src.modeling import (
@@ -21,6 +22,7 @@ from src.modeling import (
     forward_generated_texts_with_context,
     forward_text_batch,
     forward_texts_with_offsets,
+    generate_batch,
     load_model,
 )
 
@@ -35,6 +37,11 @@ class CharacterTokenizer:
     def __call__(self, texts, **kwargs):
         limit = kwargs.get("max_length") if kwargs.get("truncation") else None
         sequences = [[ord(char) - ord("a") + 1 for char in text[:limit]] for text in texts]
+        if kwargs.get("return_tensors") is None:
+            return {
+                "input_ids": sequences,
+                "offset_mapping": [[(j, j + 1) for j in range(len(ids))] for ids in sequences],
+            }
         width = max((len(ids) for ids in sequences), default=0)
         ids = torch.zeros((len(texts), width), dtype=torch.long)
         mask = torch.zeros_like(ids)
@@ -137,6 +144,60 @@ class ModelingTests(unittest.TestCase):
         self.assertEqual(offsets, [[], []])
         self.assertEqual(attention, [[], []])
         self.assertTrue(all(layer.shape == (2, 0, 16) for layer in hidden))
+
+    def test_replay_consumes_original_byte_tokens_and_control_ids_after_round_trip_mismatch(self):
+        backend = Tokenizer(models.BPE(
+            vocab={"[PAD]": 0, "Ã": 1, "©": 2, "Ã©": 3, "x": 4, "[CTRL]": 30, "[EOS]": 31},
+            merges=[("Ã", "©")],
+        ))
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = decoders.ByteLevel()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, pad_token="[PAD]", eos_token="[EOS]",
+            additional_special_tokens=["[CTRL]"],
+        )
+        loaded = LoadedModel("offline", {}, tokenizer, self.gpt, torch.device("cpu"))
+        prompt = [4, 4]
+        generated = [1, 30, 2, 4, 31]
+        text = tokenizer.decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        self.assertEqual(text, "éx")
+        self.assertEqual(tokenizer(text, add_special_tokens=False)["input_ids"], [3, 4])
+
+        actual, ids, offsets, attention = forward_generated_texts_with_context(
+            loaded, [prompt], [generated], [text], self.runtime,
+        )
+        self.assertEqual(ids, [generated])
+        self.assertEqual(attention, [[1] * len(generated)])
+        self.assertEqual(offsets[0][1], (0, 0))  # Internal control token.
+        self.assertEqual(offsets[0][3], (1, 2))  # Suffix still aligns after the split byte token.
+        self.assertEqual(offsets[0][4], (0, 0))  # EOS.
+        full_ids = torch.tensor([prompt + generated])
+        with torch.inference_mode():
+            expected = self.gpt.base_model(
+                input_ids=full_ids, attention_mask=torch.ones_like(full_ids),
+                position_ids=torch.arange(full_ids.shape[1])[None, :],
+                output_hidden_states=True, use_cache=False,
+            ).hidden_states
+        for actual_layer, expected_layer in zip(actual, expected):
+            torch.testing.assert_close(actual_layer, expected_layer[:, len(prompt):])
+
+    def test_generation_trims_padding_after_any_configured_eos(self):
+        prompts = ["a", "b", "c"]
+        raw_outputs = [[0, 29, 0, 0], [31, 4, 30, 0], [3, 4, 5, 0]]
+        tokenizer = CharacterTokenizer()
+        tokenizer.eos_token_id = 31
+        model = SimpleNamespace(generate=lambda **kwargs: torch.tensor([
+            [i + 1, *ids] for i, ids in enumerate(raw_outputs)
+        ]))
+        loaded = LoadedModel("offline", {}, tokenizer, model, torch.device("cpu"))
+        generation = {"max_new_tokens": 4, "min_new_tokens": 0, "do_sample": False}
+        with patch.object(tokenizer, "batch_decode", create=True, return_value=["x", "y", "z"]) as decode:
+            for eos, expected in (([29, 30], [[0, 29], [31, 4, 30], raw_outputs[2]]), (None, raw_outputs)):
+                with self.subTest(eos=eos):
+                    model.generation_config = SimpleNamespace(eos_token_id=eos)
+                    ids, _, _, _ = generate_batch(loaded, prompts, generation, self.runtime)
+                    self.assertEqual(ids, expected)
+                    self.assertEqual(decode.call_args.args[0], expected)
 
     def test_bloom_does_not_receive_unsupported_position_ids(self):
         recorded = []

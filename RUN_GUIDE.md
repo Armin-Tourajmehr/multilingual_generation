@@ -42,9 +42,9 @@ The smoke test avoids automatic Stanza downloads so it does not unexpectedly dow
 
 Under `outputs/analysis_results/<model>/`:
 
-- `generated_outputs/<language>.parquet`: generated text and prompt.
-- `token_posteriors/<language>.parquet`: posterior per output token and layer, character offsets, Stanza `upos`/`xpos`/features, and POS alignment status.
-- `sentence_level_posteriors/<language>.parquet`: average output-token posterior per sample and layer.
+- `generated_outputs/<language>.parquet` stores the text and the original `prompt_token_ids` and `generated_token_ids` used for replay.
+- `token_posteriors/<language>.parquet` stores the posterior per non-special output token and layer. `sequence_position` indexes the original generated IDs. POS alignment uses character offsets, with `no_offset` or `unaligned` when a token has no usable word span.
+- `sentence_level_posteriors/<language>.parquet` averages the retained output-token scores per sample and layer, including tokens without POS alignment.
 - `lexical_analysis/pos_posterior_summary/<language>.csv`: mean posterior for each candidate language grouped by layer and POS tag.
 - `manifold/spectral_embedding_coordinates.csv`, per-layer PNGs and `spectral_embedding_all_layers.pdf`: Spectral Embedding of the per-language GMM centroids in PCA space.
 - `analysis_counts.csv`: processed Aya row counts.

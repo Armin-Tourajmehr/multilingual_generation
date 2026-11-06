@@ -261,9 +261,11 @@ outputs/analysis_results/<model>/
     analysis_counts.csv
 ```
 
-`token_posteriors` contains generated-token × layer posterior records.
+`generated_outputs` records the prompt and continuation IDs used for replay, alongside the decoded text. The continuation includes the sampled stop token when present.
 
-`sentence_level_posteriors` contains one row per Aya sample and layer, with posterior probabilities averaged across generated tokens for that sample.
+`token_posteriors` scores the contextual state after consuming each non-special generated token. `sequence_position` indexes the original continuation IDs. Character spans and POS tags are aligned separately. Tokens with ambiguous spans or whitespace still have scores and carry a `no_offset` or `unaligned` POS status.
+
+`sentence_level_posteriors` averages the scores of all retained tokens per Aya sample and layer, including tokens without a POS alignment.
 
 ## Other run metadata
 
@@ -287,7 +289,7 @@ These tests validate the main configuration, the 18-language setup, GPU-only num
 
 ## Runtime optimizations
 
-The main experiment is designed for a single NVIDIA T4-class GPU. PCA and Aya GMM statistics are computed on CUDA. Generation captures pre-emission hidden states directly from the same cached autoregressive generation pass, avoiding a second full-sequence forward pass. Saved PCA and complete Aya-GMM fits are reused automatically on subsequent runs; use `--force-refit-pca` or `--force-refit-gmm` only when a deliberate refit is required.
+The main experiment is designed for a single NVIDIA T4-class GPU. PCA and Aya GMM statistics are computed on CUDA. Generation uses the model's cache, then a causal forward pass replays the original prompt and continuation IDs to collect contextual hidden states. Saved PCA and Aya-GMM fits are reused automatically on subsequent runs. Use `--force-refit-pca` or `--force-refit-gmm` for a deliberate refit.
 
 The default Kaggle configuration uses FP16, generation batch size 1 for peak-memory safety, representation batch size 8, and a 512-token maximum input length. This processes every configured Aya sample row; only inputs longer than the configured token limit are truncated.
 

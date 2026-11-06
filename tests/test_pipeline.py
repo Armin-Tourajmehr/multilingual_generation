@@ -19,6 +19,7 @@ from src.data import clear_aya_cache
 from src.gmm import GPULanguageGMM
 from src.lexical import align_pos_to_token
 from src.pca_gpu import GPUPCA
+from src.postprocess import annotate_token_file
 
 
 class FakeTagger:
@@ -52,7 +53,11 @@ class PipelineTests(unittest.TestCase):
         }
         self.loaded = SimpleNamespace(
             name="fake", device=torch.device("cpu"),
-            tokenizer=SimpleNamespace(convert_ids_to_tokens=lambda token_id: f"id{token_id}"),
+            tokenizer=SimpleNamespace(
+                convert_ids_to_tokens=lambda token_id: f"id{token_id}",
+                all_special_ids=[98],
+                added_tokens_decoder={99: SimpleNamespace(special=True)},
+            ),
             spec={"model_name": "fake/model", "torch_dtype": "float32"},
             model=SimpleNamespace(config=SimpleNamespace(_commit_hash="fixed")),
         )
@@ -60,7 +65,11 @@ class PipelineTests(unittest.TestCase):
         self.gmms = [GPULanguageGMM(torch.tensor([[0., 0.], [1., 1.]]), torch.ones(2, 2),
                                     ["en", "fa"], torch.tensor([0.4, 0.6])) for _ in range(2)]
         self.fixtures = {
-            "first": ("Hi x", [10, 11, 12], [(0, 2), (2, 3), (3, 4)], [[0., 0.], [9., 9.], [1., 1.]]),
+            "first": (
+                "Hi x", [10, 11, 99, 12, 15, 98],
+                [(0, 2), (2, 3), (0, 0), (3, 4), (0, 0), (0, 0)],
+                [[0., 0.], [9., 9.], [2., 2.], [1., 1.], [3., 3.], [4., 4.]],
+            ),
             "empty": ("", [], [], []),
             "last": ("Go.", [13, 14], [(0, 2), (2, 3)], [[2., 1.], [1., 2.]]),
         }
@@ -95,7 +104,7 @@ class PipelineTests(unittest.TestCase):
                 mock.patch.object(pipeline, "forward_generated_texts_with_context", side_effect=self.replay), \
                 mock.patch.object(pipeline, "StanzaTagger", FakeTagger), \
                 mock.patch.object(pipeline.gc, "collect") as collect:
-            pipeline._analyze_model(cfg, self.loaded, self.pcas, self.gmms, path)
+            self.analysis_stats = pipeline._analyze_model(cfg, self.loaded, self.pcas, self.gmms, path)
         return path, collect.call_count
 
     def expected_rows(self, lexical_enabled=False, status="disabled"):
@@ -109,7 +118,7 @@ class PipelineTests(unittest.TestCase):
                     words, tag_status = tagger.tag_text(text, "en") if lexical_enabled and text else ([], status)
                     rows = []
                     for seq, (token_id, (start, end)) in enumerate(zip(ids, spans)):
-                        if end <= start or not text[start:end].strip():
+                        if token_id in {98, 99}:
                             continue
                         values = self.gmms[layer].posterior(
                             self.pcas[layer].transform(torch.tensor([vectors[seq]]) + layer * 0.25)
@@ -151,10 +160,25 @@ class PipelineTests(unittest.TestCase):
         self.assert_parquet_matches(path / "token_posteriors/en.parquet", tokens)
         self.assert_parquet_matches(path / "sentence_level_posteriors/en.parquet", sentences)
         outputs = [dict(model="fake", sample_id=sid, input_language="en", prompt=prompt,
-                        generated_text=self.fixtures[prompt][0], generated_token_count=len(self.fixtures[prompt][1]))
+                        generated_text=self.fixtures[prompt][0], generated_token_count=len(self.fixtures[prompt][1]),
+                        generated_token_ids=self.fixtures[prompt][1], prompt_token_ids=[sid - 100])
                    for sid, prompt in zip([101, 102, 103], ["first", "empty", "last"])]
         self.assert_parquet_matches(path / "generated_outputs/en.parquet", outputs)
         self.assertEqual(collections, 0)
+
+    def test_original_token_positions_keep_invisible_ids_and_exclude_special_ids(self):
+        path, _ = self.run_analysis()
+        token_rows = pq.read_table(path / "token_posteriors/en.parquet").to_pylist()
+        first = [row for row in token_rows if row["sample_id"] == 101 and row["layer"] == 0]
+        self.assertEqual([row["token_id"] for row in first], [10, 11, 12, 15])
+        self.assertEqual([row["sequence_position"] for row in first], [0, 1, 3, 4])
+        self.assertEqual([row["token_position"] for row in first], [0, 1, 2, 3])
+        self.assertEqual((first[1]["token"], first[1]["pos_status"]), (" ", "unaligned"))
+        self.assertEqual((first[-1]["token"], first[-1]["model_token"], first[-1]["pos_status"]),
+                         ("", "id15", "no_offset"))
+        self.assertEqual((first[-1]["char_start"], first[-1]["char_end"]), (0, 0))
+        self.assertEqual(self.analysis_stats["generated_tokens"], 8)
+        self.assertEqual(self.analysis_stats["analyzed_output_tokens"], 6)
 
     def test_pos_summary_matches_token_aggregates_and_can_be_disabled(self):
         cfg = copy.deepcopy(self.cfg)
@@ -178,9 +202,29 @@ class PipelineTests(unittest.TestCase):
         # run_analysis patches the tagger class internally; replace its constructor with a failure.
         with mock.patch.object(FakeTagger, "__init__", side_effect=AssertionError("Stanza must be deferred")):
             path, _ = self.run_analysis(cfg)
-        rows = pq.read_table(path / "token_posteriors/en.parquet").to_pylist()
-        self.assertTrue(all(row["pos_status"] == "deferred" and row["upos"] == "POS_UNAVAILABLE" for row in rows))
-        self.assertFalse((path / "lexical_analysis/pos_posterior_summary").exists())
+        token_path = path / "token_posteriors/en.parquet"
+        rows = pq.read_table(token_path).to_pylist()
+        status_by_token = {row["token_id"]: (row["pos_status"], row["upos"]) for row in rows}
+        self.assertEqual(status_by_token[10], ("deferred", "POS_UNAVAILABLE"))
+        self.assertEqual(status_by_token[11], ("unaligned", "NO_WORD_ALIGNMENT"))
+        self.assertEqual(status_by_token[15], ("no_offset", "SPECIAL_OR_EMPTY_OFFSET"))
+        summary_path = path / "lexical_analysis/pos_posterior_summary/en.csv"
+        self.assertFalse(summary_path.exists())
+
+        annotate_token_file(
+            token_path, path / "generated_outputs/en.parquet",
+            model="fake", language="en", languages=cfg["languages"],
+            lexical_config=cfg["lexical_analysis"], summary_path=summary_path,
+            batch_size=2, tagger_factory=FakeTagger,
+        )
+        annotated = pq.read_table(token_path).to_pylist()
+        annotated_status = {row["token_id"]: (row["pos_status"], row["upos"]) for row in annotated}
+        self.assertEqual(annotated_status[10], ("ok", "NOUN"))
+        self.assertEqual(annotated_status[11], status_by_token[11])
+        self.assertEqual(annotated_status[15], status_by_token[15])
+        self.assertEqual([(row["sequence_position"], row["P_en"], row["P_fa"]) for row in annotated],
+                         [(row["sequence_position"], row["P_en"], row["P_fa"]) for row in rows])
+        self.assertTrue(summary_path.exists())
 
     def test_optional_gc_interval(self):
         cfg = copy.deepcopy(self.cfg)
@@ -197,7 +241,11 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(empty), 2)
         self.assertTrue(all(row["num_output_tokens"] == 0 and row["P_en"] == 0.0 and row["P_fa"] == 0.0
                             for row in empty))
-        self.assertEqual(pq.read_table(path / "token_posteriors/en.parquet").num_rows, 8)
+        self.assertEqual(pq.read_table(path / "token_posteriors/en.parquet").num_rows, 12)
+        outputs = pq.read_table(path / "generated_outputs/en.parquet")
+        self.assertEqual(outputs.schema.field("generated_token_ids").type, pa.list_(pa.int64()))
+        self.assertEqual(outputs.schema.field("prompt_token_ids").type, pa.list_(pa.int64()))
+        self.assertEqual(outputs["generated_token_ids"].to_pylist()[1], [])
 
     def test_batched_gather_matches_per_token_reference_and_honors_chunks(self):
         hidden = [torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) / 10,

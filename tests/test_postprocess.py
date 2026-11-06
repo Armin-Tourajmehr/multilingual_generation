@@ -270,12 +270,12 @@ class PostprocessTests(unittest.TestCase):
         self.assertEqual(self.summary_path.read_text().strip(), ",".join(SUMMARY_COLUMNS))
         factory.assert_not_called()
 
-    def test_empty_generated_text_is_marked_without_loading_tagger(self):
+    def test_empty_generated_text_has_no_offsets_and_skips_tagger(self):
         self.write_generated([{"sample_id": 1, "generated_text": ""}, {"sample_id": 2, "generated_text": ""}])
         factory = Mock(side_effect=AssertionError("no tagger should be needed"))
         annotate_outputs(self.cfg, tagger_factory=factory)
         result = pq.read_table(self.token_path)
-        self.assertEqual(result["pos_status"].to_pylist(), ["empty"] * 4)
+        self.assertEqual(result["pos_status"].to_pylist(), ["no_offset"] * 4)
         self.assert_nonannotation_equal(self.original, result)
         factory.assert_not_called()
 

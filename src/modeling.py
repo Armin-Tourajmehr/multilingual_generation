@@ -9,6 +9,8 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .token_alignment import align_generated_token_offsets
+
 
 @dataclass
 class LoadedModel:
@@ -254,8 +256,7 @@ def _generate_on_device(
 ) -> tuple[list[list[int]], list[str], int, list[list[int]]]:
     """Generate text without storing every layer's decode-time hidden states.
 
-    Generated texts are forwarded separately by the analysis stage. This avoids
-    retaining all per-step generation hidden states and fixes token/state alignment.
+    The analysis stage replays the generated IDs to extract contextual states.
     """
     if not prompts:
         raise ValueError("Generation received an empty prompt batch.")
@@ -295,12 +296,18 @@ def _generate_on_device(
         generated = loaded.model.generate(**tok, **kwargs)
 
     generated_ids = generated[:, input_width:].detach().cpu().tolist()
-    eos = loaded.tokenizer.eos_token_id
-    if eos is not None:
-        eos = int(eos)
+    # Generation may stop on several different EOS IDs (e.g. Llama's end-of-turn
+    # marker). Retain the sampled stop token and discard its batch-padding tail.
+    eos = getattr(
+        getattr(loaded.model, "generation_config", None),
+        "eos_token_id",
+        getattr(loaded.tokenizer, "eos_token_id", None),
+    )
+    eos_ids = {eos} if isinstance(eos, int) else set(eos or ())
+    if eos_ids:
         for i, ids in enumerate(generated_ids):
             for pos, token_id in enumerate(ids):
-                if int(token_id) == eos:
+                if token_id in eos_ids:
                     generated_ids[i] = ids[:pos + 1]
                     break
     texts = loaded.tokenizer.batch_decode(
@@ -320,65 +327,18 @@ def forward_generated_texts_with_context(
     generated_texts: list[str],
     runtime: dict[str, Any],
 ) -> tuple[list[torch.Tensor], list[list[int]], list[list[tuple[int, int]]], list[list[int]]]:
-    """Forward decoded generated text appended to the actual tokenized prompt.
+    """Replay original prompt and continuation IDs, then align text offsets separately.
 
-    This preserves prompt context for each output token. The output text is encoded
-    without automatically-added BOS/EOS tokens to obtain character offsets; those
-    token ids are appended to the actual prompt token ids, and the hidden states at
-    those output positions are returned in a compact output-only tensor. If decode /
-    re-encode changes a token sequence, the function warns but continues with the
-    re-encoded surface text, which is what the POS offsets describe.
+    The returned hidden states correspond to the positions after consuming each
+    generated token, including special tokens. A token without a reliable text
+    span still has its original position and hidden state.
     """
     if not (len(prompt_token_ids) == len(generated_ids) == len(generated_texts)):
         raise ValueError("Prompt IDs, generated IDs and generated texts must have equal batch lengths.")
 
-    try:
-        enc = loaded.tokenizer(
-            generated_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-    except (NotImplementedError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"Tokenizer for model {loaded.name} must support fast-tokenizer offset_mapping "
-            "to align model tokens with Stanza POS tags."
-        ) from exc
-
-    encoded_ids_all = enc["input_ids"].detach().cpu().tolist()
-    encoded_mask_all = enc["attention_mask"].detach().cpu().tolist()
-    offset_all = enc.pop("offset_mapping").detach().cpu().tolist()
-    output_token_ids: list[list[int]] = []
-    output_offsets: list[list[tuple[int, int]]] = []
-    output_attention: list[list[int]] = []
-    sequences: list[list[int]] = []
-
-    all_special_ids = set(int(value) for value in (getattr(loaded.tokenizer, "all_special_ids", None) or []))
-    mismatched_samples = 0
-    for i, (prompt_ids, gen_ids, text) in enumerate(zip(prompt_token_ids, generated_ids, generated_texts)):
-        keep_positions = [j for j, keep in enumerate(encoded_mask_all[i]) if int(keep) == 1]
-        ids = [int(encoded_ids_all[i][j]) for j in keep_positions]
-        offsets = [(int(offset_all[i][j][0]), int(offset_all[i][j][1])) for j in keep_positions]
-
-        # Compare the surface-text round trip with the generated token stream, excluding
-        # special markers that decode(skip_special_tokens=True) intentionally removed.
-        generated_surface_ids = [int(t) for t in gen_ids if int(t) not in all_special_ids]
-        if generated_surface_ids != ids:
-            mismatched_samples += 1
-
-        output_token_ids.append(ids)
-        output_offsets.append(offsets)
-        output_attention.append([1] * len(ids))
-        sequences.append([int(t) for t in prompt_ids] + ids)
-
-    if mismatched_samples:
-        print(
-            f"[{loaded.name}] WARNING: decoded/re-encoded output token IDs differed for "
-            f"{mismatched_samples}/{len(generated_texts)} sample(s); using offsets/tokens "
-            "from the decoded text and forwarding that surface form with the original prompt IDs."
-        )
+    output_token_ids = [list(ids) for ids in generated_ids]
+    output_attention = [[1] * len(ids) for ids in output_token_ids]
+    sequences = [list(prompt) + ids for prompt, ids in zip(prompt_token_ids, output_token_ids)]
 
     batch_size = len(sequences)
     max_sequence_len = max((len(seq) for seq in sequences), default=0)
@@ -390,7 +350,7 @@ def forward_generated_texts_with_context(
     left_padding = max_sequence_len - sequence_lengths
     ids_tensor = torch.full((batch_size, max_sequence_len), int(pad_token_id), dtype=torch.long)
     # Scatter all variable-length sequences at once rather than assigning one
-    # padded row at a time. Token lists are already on CPU for offset alignment.
+    # padded row at a time.
     flat_ids = torch.tensor([token for sequence in sequences for token in sequence], dtype=torch.long)
     sample_indices = torch.arange(batch_size).repeat_interleave(sequence_lengths)
     sequence_starts = (sequence_lengths.cumsum(0) - sequence_lengths).repeat_interleave(sequence_lengths)
@@ -420,6 +380,7 @@ def forward_generated_texts_with_context(
         output_hidden_states.append(output_hidden)
 
     del full_hidden_states, model_inputs, ids_tensor, mask_tensor
+    output_offsets = align_generated_token_offsets(loaded.tokenizer, output_token_ids, generated_texts)
     return output_hidden_states, output_token_ids, output_offsets, output_attention
 
 

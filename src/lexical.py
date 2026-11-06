@@ -247,17 +247,7 @@ def align_pos_to_token(
     tag_status: str,
 ) -> dict[str, Any]:
     """Assign the Stanza word with the largest character-span overlap to a model token."""
-    if tag_status != "ok":
-        return {
-            "word_text": "",
-            "upos": "POS_UNAVAILABLE",
-            "xpos": "",
-            "feats": "",
-            "sentence_id": -1,
-            "word_id": -1,
-            "pos_status": tag_status,
-        }
-    if end <= start:
+    if not 0 <= start < end <= len(text):
         return {
             "word_text": "",
             "upos": "SPECIAL_OR_EMPTY_OFFSET",
@@ -267,10 +257,22 @@ def align_pos_to_token(
             "word_id": -1,
             "pos_status": "no_offset",
         }
+    token_text = text[start:end]
+    whitespace_only = not token_text.strip()
+    if tag_status != "ok" and not whitespace_only:
+        return {
+            "word_text": "",
+            "upos": "POS_UNAVAILABLE",
+            "xpos": "",
+            "feats": "",
+            "sentence_id": -1,
+            "word_id": -1,
+            "pos_status": tag_status,
+        }
 
     best = None
     best_overlap = 0
-    for word in words:
+    for word in () if whitespace_only else words:
         word_start, word_end = int(word["char_start"]), int(word["char_end"])
         if word_start < 0 or word_end <= word_start:
             continue
@@ -280,7 +282,7 @@ def align_pos_to_token(
             best = word
     if best is None:
         return {
-            "word_text": text[start:end],
+            "word_text": token_text,
             "upos": "NO_WORD_ALIGNMENT",
             "xpos": "",
             "feats": "",

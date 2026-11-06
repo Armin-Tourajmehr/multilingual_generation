@@ -277,6 +277,20 @@ Use the prompt and consumed-output scores to compare the same kind of state acro
 
 `sentence_level_posteriors` averages the scores of all retained tokens per Aya sample and layer, including tokens without a POS alignment.
 
+### Figure 1 — Prompt and continuation language affinity
+
+Run the report after the experiment finishes. It reads the saved Parquet files on CPU.
+
+```bash
+python scripts/plot_language_affinity.py --config configs/b200_config.yaml
+```
+
+The B200 preset writes `outputs/b200/analysis_results/<model>/figures/figure1_language_affinity.pdf`. Each page shows one source language with prompt, continuation, and paired difference heatmaps. The first two panels share a 0–100% posterior scale. The difference uses a zero-centered scale in percentage points, shared across all pages and models in the command.
+
+The report averages prompt tokens within each Aya item and layer, then pairs those means with `sentence_level_posteriors` using the same item and layer. Each matched item contributes equally to both phases. Items without scored tokens in either phase are excluded from that layer, and the page reports the paired counts. The command lists and skips source languages without any paired items. The prompt scores are in-sample for the Aya fit. Continuations are grouped by prompt language.
+
+Use `--models mgpt` and `--languages en fa` to select pages while keeping the configured candidate-language pool. For a copy of the run on another machine, use `--results-dir` to point at the directory containing the model folders and `--output-dir` to choose where to write the reports.
+
 ## Other run metadata
 
 ```text

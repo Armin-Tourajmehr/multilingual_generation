@@ -138,6 +138,17 @@ def _pca_fingerprint(cfg: dict[str, Any], loaded: LoadedModel) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _pca_basis_fingerprint(pcas: list[GPUPCA]) -> str:
+    """Hash the fitted transforms in layer order, independent of device and storage layout."""
+    digest = hashlib.sha256(b"pca-basis-v1\n")
+    for pca in pcas:
+        for tensor in (pca.mean, pca.components):
+            values = tensor.detach().cpu().contiguous()
+            digest.update(f"{values.dtype}:{tuple(values.shape)}\n".encode("ascii"))
+            digest.update(memoryview(values.numpy()).cast("B"))
+    return digest.hexdigest()
+
+
 def _aya_content_fingerprints(cfg: dict[str, Any]) -> dict[str, str]:
     """Hash the selected, cleaned input rows rather than only their counts/paths."""
     hashes = {}
@@ -167,10 +178,14 @@ def _configured_language_priors(
 
 
 def _gmm_fingerprint(
-    cfg: dict[str, Any], loaded: LoadedModel, expected_sample_counts: dict[str, int]
+    cfg: dict[str, Any],
+    loaded: LoadedModel,
+    expected_sample_counts: dict[str, int],
+    pca_basis_fingerprint: str,
 ) -> str:
     payload = {
         "pca_fingerprint": _pca_fingerprint(cfg, loaded),
+        "pca_basis_fingerprint": pca_basis_fingerprint,
         "languages": list(cfg["languages"]),
         "aya_root": str(cfg["data"].get("root_dir")),
         "input_column": cfg["data"].get("input_column"),
@@ -481,7 +496,9 @@ def _fit_aya_gmms(
     gmm_root: Path,
     pca_root: Path,
     expected_sample_counts: dict[str, int],
-    force_refit: bool = False,
+    *,
+    fingerprint: str,
+    pca_basis_fingerprint: str,
 ) -> list[GPULanguageGMM]:
     """
     Fit one diagonal, one-component GMM per language
@@ -679,6 +696,10 @@ def _fit_aya_gmms(
         exist_ok=True,
     )
 
+    # Mark the old cache incomplete before replacing any layer files.
+    metadata_path = model_dir / "metadata.json"
+    metadata_path.unlink(missing_ok=True)
+
     for layer, gmm in enumerate(
         gmms
     ):
@@ -690,6 +711,7 @@ def _fit_aya_gmms(
             sample_counts=(
                 expected_sample_counts
             ),
+            cache_fingerprint=f"{fingerprint}:{layer}",
         )
 
     # --------------------------------------------------------
@@ -790,13 +812,12 @@ def _fit_aya_gmms(
                 / loaded.name
             ).resolve()
         ),
-        "fingerprint": _gmm_fingerprint(cfg, loaded, expected_sample_counts),
+        "fingerprint": fingerprint,
         "pca_fingerprint": _pca_fingerprint(cfg, loaded),
+        "pca_basis_fingerprint": pca_basis_fingerprint,
     }
 
-    with (
-        model_dir / "metadata.json"
-    ).open(
+    with metadata_path.open(
         "w",
         encoding="utf-8",
     ) as f:
@@ -822,12 +843,7 @@ def _load_gmms_or_fit(
     expected_sample_counts: dict[str, int],
     force_refit: bool = False,
 ) -> list[GPULanguageGMM]:
-    """
-    Load saved Aya GMMs if they match the current
-    empirical-prior configuration.
-
-    Otherwise fit them on all Aya samples.
-    """
+    """Reuse saved Aya GMMs only for the same data, settings, and fitted PCA basis."""
 
     model_dir = (
         gmm_root / loaded.name
@@ -853,6 +869,8 @@ def _load_gmms_or_fit(
         )
         for language in cfg["languages"]
     }
+    pca_basis_fingerprint = _pca_basis_fingerprint(pcas)
+    fingerprint = _gmm_fingerprint(cfg, loaded, expected_counts, pca_basis_fingerprint)
 
     # --------------------------------------------------------
     # Try to reuse existing GMM
@@ -916,10 +934,8 @@ def _load_gmms_or_fit(
                 )
                 == expected_counts
             )
-            same_fingerprint = (
-                meta.get("fingerprint")
-                == _gmm_fingerprint(cfg, loaded, expected_sample_counts)
-            )
+            same_fingerprint = meta.get("fingerprint") == fingerprint
+            same_pca_basis = meta.get("pca_basis_fingerprint") == pca_basis_fingerprint
 
             if (
                 same_pca
@@ -928,28 +944,24 @@ def _load_gmms_or_fit(
                 and same_prior_type
                 and same_sample_counts
                 and same_fingerprint
+                and same_pca_basis
             ):
-
+                gmms = [
+                    load_gmm(path, loaded.device, expected_cache_fingerprint=f"{fingerprint}:{layer}")
+                    for layer, path in enumerate(paths)
+                ]
                 print(
                     f"[{loaded.name}] "
                     f"Reusing saved Aya GMMs "
                     f"from: "
                     f"{model_dir.resolve()}"
                 )
-
-                return [
-                    load_gmm(
-                        path,
-                        loaded.device,
-                    )
-                    for path in paths
-                ]
+                return gmms
 
             print(
                 f"[{loaded.name}] "
                 f"Existing Aya GMMs do not "
-                f"match the current "
-                f"empirical-prior setup. "
+                f"match the current settings or fitted PCA basis. "
                 f"Refitting."
             )
 
@@ -957,7 +969,7 @@ def _load_gmms_or_fit(
 
             print(
                 f"[{loaded.name}] "
-                f"Saved GMM metadata could "
+                f"Saved GMM cache could "
                 f"not be validated "
                 f"({exc}); refitting."
             )
@@ -973,7 +985,8 @@ def _load_gmms_or_fit(
         gmm_root,
         pca_root,
         expected_sample_counts,
-        force_refit=force_refit,
+        fingerprint=fingerprint,
+        pca_basis_fingerprint=pca_basis_fingerprint,
     )
 
 

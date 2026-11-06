@@ -18,7 +18,7 @@ from src import pipeline
 from src.data import clear_aya_cache
 from src.gmm import GPULanguageGMM
 from src.lexical import align_pos_to_token
-from src.pca_gpu import GPUPCA
+from src.pca_gpu import GPUPCA, load_pca, save_pca
 from src.postprocess import annotate_token_file
 
 
@@ -271,16 +271,95 @@ class PipelineTests(unittest.TestCase):
         for language in self.cfg["languages"]:
             pd.DataFrame({"sample_id": [1, 2], "inputs": ["one", "two"]}).to_csv(data_path / f"{language}.csv", index=False)
         counts = {"en": 2, "fa": 2}
-        fingerprint = pipeline._gmm_fingerprint(self.cfg, self.loaded, counts)
+        basis_fingerprint = pipeline._pca_basis_fingerprint(self.pcas)
+
+        def fingerprint(cfg):
+            return pipeline._gmm_fingerprint(cfg, self.loaded, counts, basis_fingerprint)
+
+        original = fingerprint(self.cfg)
         changed = copy.deepcopy(self.cfg)
         changed["runtime"]["max_input_tokens"] = 32
-        self.assertNotEqual(fingerprint, pipeline._gmm_fingerprint(changed, self.loaded, counts))
+        self.assertNotEqual(original, fingerprint(changed))
         changed = copy.deepcopy(self.cfg)
         changed["representation"]["equal_language_priors"] = True
-        self.assertNotEqual(fingerprint, pipeline._gmm_fingerprint(changed, self.loaded, counts))
+        self.assertNotEqual(original, fingerprint(changed))
         pd.DataFrame({"sample_id": [1, 2], "inputs": ["replacement", "two"]}).to_csv(data_path / "en.csv", index=False)
         clear_aya_cache()
-        self.assertNotEqual(fingerprint, pipeline._gmm_fingerprint(self.cfg, self.loaded, counts))
+        self.assertNotEqual(original, fingerprint(self.cfg))
+
+    def test_gmm_cache_follows_reloaded_pca_basis_and_rejects_mixed_layers(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["runtime"]["evaluation_batch_size"] = 2
+        cfg["representation"].update(gmm_components=1, gmm_covariance_type="diag")
+        data_path = self.root / "data"
+        data_path.mkdir()
+        features = {"en-1": [1., 2.], "en-2": [2., 1.], "fa-1": [4., -2.], "fa-2": [5., -1.]}
+        for language in cfg["languages"]:
+            pd.DataFrame({"sample_id": [1, 2], "inputs": [f"{language}-1", f"{language}-2"]}).to_csv(
+                data_path / f"{language}.csv", index=False
+            )
+
+        gmm_root = self.root / "gmm"
+        pca_root = self.root / "pca"
+        counts = {"en": 2, "fa": 2}
+        layer_path = gmm_root / self.loaded.name / "layer_000.pt"
+
+        def reload_pcas(pcas):
+            paths = [pca_root / self.loaded.name / f"layer_{i:03d}.pt" for i in range(len(pcas))]
+            for path, pca in zip(paths, pcas):
+                save_pca(path, pca)
+            return [load_pca(path, self.loaded.device) for path in paths]
+
+        def load_or_fit(pcas):
+            return pipeline._load_gmms_or_fit(cfg, self.loaded, pcas, gmm_root, pca_root, counts)
+
+        def cpu_stats(n_layers, n_languages, pca_dim, device):
+            sums = torch.zeros(n_layers, n_languages, pca_dim, device=device)
+            return sums, torch.zeros_like(sums), torch.zeros(n_layers, n_languages, dtype=torch.long, device=device)
+
+        def forward_text(loaded, prompts, max_input_tokens, runtime):
+            hidden = torch.tensor([features[prompt] for prompt in prompts]).unsqueeze(1)
+            return [hidden, hidden + 0.5], torch.ones(hidden.shape[:2], dtype=torch.bool)
+
+        # Use the real fit and serialization path with CPU statistics and fixed model vectors.
+        with mock.patch.object(pipeline, "init_gmm_stats", side_effect=cpu_stats), \
+                mock.patch.object(pipeline, "forward_text_batch", side_effect=forward_text) as forward:
+            original = load_or_fit(reload_pcas(self.pcas))
+            forward.assert_called()
+            original_layer_bytes = layer_path.read_bytes()
+
+            forward.reset_mock()
+            reused = load_or_fit(reload_pcas(self.pcas))
+            forward.assert_not_called()
+            torch.testing.assert_close(reused[0].means, original[0].means)
+
+            first, second = self.pcas
+            sign = torch.tensor([-1., 1.])
+            flipped = GPUPCA(first.mean, sign[:, None] * first.components, first.explained_variance)
+            updated = load_or_fit(reload_pcas([flipped, second]))
+            forward.assert_called()
+            torch.testing.assert_close(updated[0].means, original[0].means * sign)
+            torch.testing.assert_close(updated[1].means, original[1].means)
+
+            forward.reset_mock()
+            shift = torch.tensor([0.5, 1.25])
+            centered = GPUPCA(second.mean + shift, second.components, second.explained_variance)
+            current_basis = reload_pcas([flipped, centered])
+            recentered = load_or_fit(current_basis)
+            forward.assert_called()
+            torch.testing.assert_close(recentered[1].means, original[1].means - shift)
+
+            # Simulate a stale layer alongside current metadata and another current layer.
+            layer_path.write_bytes(original_layer_bytes)
+            forward.reset_mock()
+            repaired = load_or_fit(current_basis)
+            forward.assert_called()
+            torch.testing.assert_close(repaired[0].means, recentered[0].means)
+            torch.testing.assert_close(repaired[1].means, recentered[1].means)
+
+            forward.reset_mock()
+            load_or_fit(current_basis)
+            forward.assert_not_called()
 
     def test_partition_writer_accepts_arrow_tables_and_legacy_rows(self):
         path = self.root / "partition.parquet"

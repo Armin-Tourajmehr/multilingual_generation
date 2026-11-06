@@ -53,7 +53,7 @@ The manifold contains one point per language per layer (GMM centroids); it is no
 
 ## 6. Rerunning after config changes
 
-PCA and GMM caches carry configuration fingerprints. If languages, reference-data settings, model identity/revision, attention backend, sampling settings or PCA configuration change, stale PCA/GMM caches are rebuilt rather than reused silently. GMM keys also include input truncation and selected Aya text/ID content. The mask-relative position fix invalidates earlier fits. Use `--force-refit-pca` or `--force-refit-gmm` to force an otherwise valid cache to be recomputed.
+PCA and GMM caches carry configuration fingerprints. Changes to languages, reference data, model identity or revision, attention backend, sampling settings, or PCA configuration invalidate the corresponding caches. GMM keys also include input truncation, selected Aya texts and IDs, and the fitted PCA means and components for every layer. A change to those fitted coordinates automatically refits the GMMs. GMM caches created before basis fingerprints were added refit once. Use `--force-refit-pca` or `--force-refit-gmm` to force a refit.
 
 ## 7. B200 runs and deferred POS
 

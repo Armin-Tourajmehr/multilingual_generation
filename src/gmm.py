@@ -125,7 +125,13 @@ def finalize_gmm(
     return models
 
 
-def save_gmm(path: Path, model: GPULanguageGMM, sample_counts: dict[str, int] | None = None) -> None:
+def save_gmm(
+    path: Path,
+    model: GPULanguageGMM,
+    sample_counts: dict[str, int] | None = None,
+    *,
+    cache_fingerprint: str | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     state = {
         "means": model.means.detach().cpu(),
@@ -135,11 +141,17 @@ def save_gmm(path: Path, model: GPULanguageGMM, sample_counts: dict[str, int] | 
     }
     if sample_counts is not None:
         state["sample_counts"] = {language: int(count) for language, count in sample_counts.items()}
+    if cache_fingerprint is not None:
+        state["cache_fingerprint"] = cache_fingerprint
     torch.save(state, path)
 
 
-def load_gmm(path: Path, device: torch.device) -> GPULanguageGMM:
+def load_gmm(
+    path: Path, device: torch.device, *, expected_cache_fingerprint: str | None = None
+) -> GPULanguageGMM:
     state = torch.load(path, map_location="cpu", weights_only=True)
+    if expected_cache_fingerprint is not None and state.get("cache_fingerprint") != expected_cache_fingerprint:
+        raise ValueError(f"GMM layer {path} does not match the current fit fingerprint.")
     means = state["means"].to(device=device, dtype=torch.float32)
     variances = state["variances"].to(device=device, dtype=torch.float32)
     languages = list(state["languages"])

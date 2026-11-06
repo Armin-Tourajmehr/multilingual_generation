@@ -17,8 +17,8 @@ def test_main_config_has_dynamic_language_and_model_lists():
     assert set(cfg["languages"]) == set(cfg["language_names"])
     assert cfg["models"]["mgpt"]["enabled"] is True
     assert cfg["models"]["bloom"]["enabled"] is True
-    assert cfg["models"]["qwen"]["enabled"] is True
-    assert cfg["models"]["llama3_1_8b"]["enabled"] is True
+    assert cfg["models"]["qwen"]["enabled"] is False
+    assert cfg["models"]["llama3_1_8b"]["enabled"] is False
     assert cfg["representation"]["pca_solver"] == "gpu_covariance"
     assert cfg["runtime"]["pca_data_path"] == "outputs/pca_data"
     assert cfg["outputs"]["gmm_dir"] == "aya_gmms"

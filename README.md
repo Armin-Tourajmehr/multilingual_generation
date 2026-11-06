@@ -1,6 +1,6 @@
 # Multilingual Representation Analysis — Kaggle Main Experiment
 
-GPU-first implementation of the multilingual representation experiment across 18 languages with mGPT and BLOOM.
+GPU-first implementation of the multilingual representation experiment across 20 configured languages with mGPT and BLOOM, plus optional Qwen and Llama runs.
 
 ## Experimental flow
 
@@ -38,9 +38,9 @@ one PCA transform + posterior calculation per layer/batch
 token + sentence-level outputs
 ```
 
-Wikipedia is used **only** to fit the shared PCA representation. For every configured language, the GMM is trained on **100% of the available Aya sample rows** for that language. There is no Aya train/test split and no Aya sampling cap.
+Wikipedia is used **only** to fit the shared PCA representation. For every configured language, the GMM is trained on the configured Aya subset (up to `data.max_samples_per_language`, currently 2,000 valid rows). The same selected prompts are used for generation; there is no independent Aya train/test split.
 
-The configured one-component diagonal GMM is implemented with streaming sufficient statistics on CUDA. This is mathematically equivalent to a one-component diagonal Gaussian and avoids a CPU-side scikit-learn fitting step.
+The configured one-component diagonal GMM is implemented with streaming sufficient statistics on CUDA. This is mathematically equivalent to a one-component diagonal Gaussian and avoids a CPU-side scikit-learn fitting step. `representation.equal_language_priors: true` uses uniform priors; otherwise priors reflect selected Aya row counts.
 
 ## GPU and memory design
 
@@ -150,6 +150,40 @@ pip install -r requirements.txt
 ```
 
 A CUDA-capable PyTorch installation is required.
+
+### B200
+
+Use a Blackwell-compatible PyTorch/CUDA environment and its matching NVIDIA driver. The generic `torch>=2.3` requirement alone does not establish Blackwell support; use the GPU provider's supported image or an appropriate current PyTorch CUDA build. See [PyTorch's Blackwell/CUDA guidance](https://pytorch.org/blog/pytorch-2-12-release-blog/).
+
+From the repository root:
+
+```bash
+python scripts/prepare_aya.py --config configs/b200_config.yaml
+python scripts/run_experiment.py --config configs/b200_config.yaml
+```
+
+The B200 preset uses BF16 model weights/autocast, larger batches and separate `outputs/b200/` caches/results. PCA/GMM accumulation remains FP32. It preserves the default model selections, model IDs, sample caps and token limits; enable Qwen/Llama explicitly if required. The initial batches are 128/64/32 for mGPT/BLOOM (Wikipedia/Aya/generation) and 64/32/16 for the optional 8B models. These are starting points to benchmark on the actual GPU. The loader now accepts per-model `attn_implementation`; this preset uses SDPA for supported models and eager attention for BLOOM, which does not support SDPA at the project's minimum Transformers version.
+
+POS tagging is deferred in this preset to keep the CPU tagger outside the GPU job. Once the GPU job finishes, run the following on a CPU machine that can access the same outputs and Stanza resources:
+
+```bash
+python scripts/annotate_outputs.py --config configs/b200_config.yaml
+```
+
+This annotates existing token Parquet files atomically and creates the usual POS summaries without loading a language model. Posterior columns and row order are preserved. Until this command completes, `pos_status` is `deferred`; POS summaries are intentionally absent. Set `lexical_analysis.deferred: false` for inline tagging, or `lexical_analysis.enabled: false` to omit POS analysis. `save_pos_posterior_summary: false` suppresses summaries in either mode.
+
+`runtime.posterior_batch_size` controls GPU posterior chunks (B200 preset: 4,096). Output metadata is shared between layers, posterior results cross to CPU once per generation batch, and Parquet is built directly from columns. `gc_collect_every_batches: 0` disables repeated full Python garbage collection inside the generation loop; model cleanup still runs. Positive values collect at the configured batch interval.
+
+With `runtime.log_performance: true`, each model writes `performance.json` under its analysis results, containing phase elapsed times and peak GPU allocation. Benchmark a short regular run with representative lengths and batches, then increase one phase's batch at a time until throughput stops improving or memory becomes limiting. Smoke mode forces batches to 1 and checks correctness/access rather than throughput. GPU speedups have not been established by the offline tests.
+
+The corrected mask-relative positions make mGPT representations independent of left padding. PCA/GMM fingerprints include the position policy, attention setting, input truncation and selected Aya content, so old fits rebuild automatically. Avoid mixing these corrected results with earlier cached fits.
+
+Offline regression tests use small randomly initialized models and do not download checkpoints:
+
+```bash
+python -m pip install pytest
+python -m pytest -q
+```
 
 ### Kaggle
 

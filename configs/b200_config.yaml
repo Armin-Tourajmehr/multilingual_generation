@@ -1,0 +1,169 @@
+# One dedicated B200 GPU: initial values to tune on representative data.
+# Model enablement, model IDs, sample counts and token budgets match config.yaml.
+# Qwen/Llama stay disabled until explicitly enabled; Llama may require Hub access.
+# BF16 model forwards; PCA/GMM statistics remain FP32. Outputs use a separate root.
+# POS is deferred: run scripts/annotate_outputs.py with this config after the GPU job.
+# Smoke mode overrides batch sizes to 1 and is not a throughput benchmark.
+project:
+  name: multilingual-representation-analysis
+  seed: 42
+languages:
+- ar
+- bn
+- en
+- es
+- eu
+- fa
+- fr
+- hi
+- id
+- ml
+- mr
+- ne
+- pt
+- sw
+- ta
+- te
+- ur
+- vi
+- zh
+- ja
+language_names:
+  ar: Arabic
+  bn: Bengali
+  en: English
+  es: Spanish
+  eu: Basque
+  fa: Persian
+  fr: French
+  hi: Hindi
+  id: Indonesian
+  ml: Malayalam
+  mr: Marathi
+  ne: Nepali
+  pt: Portuguese
+  sw: Swahili
+  ta: Tamil
+  te: Telugu
+  ur: Urdu
+  vi: Vietnamese
+  zh: Chinese
+  ja: Japanese
+data:
+  root_dir: data/aya_language_datasets
+  input_column: inputs
+  target_column: targets
+  sample_id_column: sample_id
+  max_samples_per_language: 2000
+  sampling_seed: 42
+wikipedia:
+  dataset_name: CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+  split: train
+  revision: null
+  text_column: text
+  max_samples_per_language: 3000
+  max_tokens_per_document: 128
+  shuffle_buffer_size: 10000
+models:
+  mgpt:
+    enabled: true
+    model_name: ai-forever/mGPT
+    model_type: causal_lm
+    use_chat_template: false
+    torch_dtype: bfloat16
+    attn_implementation: sdpa
+  bloom:
+    enabled: true
+    model_name: bigscience/bloom-560m
+    model_type: causal_lm
+    use_chat_template: false
+    torch_dtype: bfloat16
+    attn_implementation: eager
+  qwen:
+    enabled: false
+    model_name: Qwen/Qwen3-8B
+    model_type: causal_lm
+    use_chat_template: true
+    chat_template_kwargs:
+      enable_thinking: false
+    torch_dtype: bfloat16
+    runtime_overrides:
+      wikipedia_batch_size: 64
+      evaluation_batch_size: 32
+      generation_batch_size: 16
+      max_input_tokens: 256
+    attn_implementation: sdpa
+  llama3_1_8b:
+    enabled: false
+    model_name: meta-llama/Llama-3.1-8B-Instruct
+    model_type: causal_lm
+    use_chat_template: true
+    torch_dtype: bfloat16
+    runtime_overrides:
+      wikipedia_batch_size: 64
+      evaluation_batch_size: 32
+      generation_batch_size: 16
+      max_input_tokens: 256
+    attn_implementation: sdpa
+generation:
+  max_new_tokens: 64
+  min_new_tokens: 8
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+representation:
+  pca_dim: 700
+  pca_solver: gpu_covariance
+  gmm_components: 1
+  gmm_covariance_type: diag
+  gmm_reg_covar: 1.0e-06
+  equal_language_priors: false
+runtime:
+  device: cuda
+  require_gpu: true
+  device_map: null
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  mixed_precision: bf16
+  max_input_tokens: 512
+  generation_batch_size: 32
+  wikipedia_batch_size: 128
+  evaluation_batch_size: 64
+  pca_data_path: outputs/b200/pca_data
+  posterior_batch_size: 4096
+  gc_collect_every_batches: 0
+  log_performance: true
+lexical_analysis:
+  enabled: true
+  strict: false
+  download_missing_models: true
+  stanza_model_dir: outputs/stanza_resources
+  save_pos_posterior_summary: true
+  deferred: true
+spectral_embedding:
+  enabled: true
+  n_components: 2
+  n_neighbors: 5
+  random_state: 42
+  affinity: nearest_neighbors
+smoke_test:
+  samples_per_language: 2
+  wikipedia_samples_per_language: 2
+  pca_dim: 16
+  max_tokens_per_document: 32
+  max_input_tokens: 64
+  generation_max_new_tokens: 32
+  generation_batch_size: 1
+  wikipedia_batch_size: 1
+  evaluation_batch_size: 1
+  models:
+  - mgpt
+  - bloom
+  - qwen
+  - llama3_1_8b
+  continue_on_model_error: true
+  download_stanza_models: true
+outputs:
+  root_dir: outputs/b200
+  gmm_dir: aya_gmms
+  result_dir: analysis_results

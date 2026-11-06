@@ -8,7 +8,7 @@ import torch
 
 @dataclass
 class GPULanguageGMM:
-    """One-component diagonal Gaussian per language with empirical language priors."""
+    """One-component diagonal Gaussian per language with configurable language priors."""
 
     means: torch.Tensor
     variances: torch.Tensor

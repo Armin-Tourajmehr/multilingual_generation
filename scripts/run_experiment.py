@@ -17,8 +17,44 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import torch
 
 from src.config import load_config
+from src.modeling import _resolve_device
 from src.pipeline import run
 from src.smoke import build_smoke_config
+
+
+def cuda_preflight(cfg: dict) -> None:
+    """Check usable kernels, not only driver visibility, before downloading models."""
+    device = _resolve_device(cfg["runtime"])
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"Compiled CUDA architectures: {torch.cuda.get_arch_list()}")
+    print(f"Visible GPU count: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        print(f"GPU {i}: {props.name} | {props.total_memory / (1024**3):.1f} GiB")
+    print(f"Selected device: {device} | capability: {torch.cuda.get_device_capability(device)}")
+    wants_bf16 = str(cfg["runtime"].get("mixed_precision", "fp16")).lower() == "bf16" or any(
+        spec.get("enabled", False) and spec.get("torch_dtype") == "bfloat16"
+        for spec in cfg["models"].values()
+    )
+    with torch.cuda.device(device):
+        bf16_supported = torch.cuda.is_bf16_supported()
+        print(f"BF16 supported: {bf16_supported}")
+        if wants_bf16 and not bf16_supported:
+            raise RuntimeError("BF16 was requested but is unsupported by the selected GPU/PyTorch build.")
+        dtype = torch.bfloat16 if wants_bf16 else torch.float32
+        try:
+            probe = torch.ones((32, 32), device=device, dtype=dtype)
+            result = probe @ probe
+            torch.cuda.synchronize(device)
+            if not torch.isfinite(result).all().item():
+                raise RuntimeError("CUDA preflight produced non-finite values.")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "CUDA kernel preflight failed. Use a PyTorch/CUDA build and NVIDIA driver "
+                "that support this GPU (including Blackwell support for B200)."
+            ) from exc
+    print("CUDA preflight: PASS")
 
 
 def main() -> None:
@@ -58,17 +94,7 @@ def main() -> None:
         print(f"Enabled smoke-test models: {[k for k, v in cfg['models'].items() if v.get('enabled')]}")
         print(f"Continue to next model after a model error: {cfg.get('smoke_test', {}).get('continue_on_model_error', False)}")
 
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA GPU is required. On Kaggle, enable Settings -> Accelerator -> GPU and restart the session."
-        )
-
-    print("CUDA preflight: PASS")
-    print(f"CUDA version: {torch.version.cuda}")
-    print(f"Visible GPU count: {torch.cuda.device_count()}")
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        print(f"GPU {i}: {props.name} | {props.total_memory / (1024**3):.1f} GiB")
+    cuda_preflight(cfg)
 
     seed = int(cfg["project"]["seed"])
     random.seed(seed)

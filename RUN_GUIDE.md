@@ -24,7 +24,7 @@ The script writes one CSV per configured language under `data/aya_language_datas
 python scripts/run_experiment.py --config configs/config.yaml
 ```
 
-All four models (`mgpt`, `bloom`, `qwen`, and `llama3_1_8b`) are enabled in the current configuration and run sequentially in YAML order. Qwen3-8B and Llama 3.1 8B Instruct require substantially more GPU memory and may fail to load on a 16 GiB GPU. Llama access may require accepting Meta's license and authenticating with Hugging Face on the target server. For the full experiment, a model error stops the run; disable models that do not fit by setting `enabled: false`.
+mGPT and BLOOM are enabled by default and run sequentially in YAML order. Qwen3-8B and Llama 3.1 8B Instruct are configured but disabled; enable them explicitly for the intended comparison. They require substantially more GPU memory and may fail to load on a 16 GiB GPU. Llama access may require accepting Meta's license and authenticating with Hugging Face on the target server. For the full experiment, a model error stops the run.
 
 Large-model settings have conservative per-model batch-size overrides. They do not guarantee that an 8B model will fit on every GPU; hardware capacity still matters. The PCA method retains GPU covariance statistics for all layers, so large hidden sizes add a noticeable GPU-memory requirement.
 
@@ -53,4 +53,15 @@ The manifold contains one point per language per layer (GMM centroids); it is no
 
 ## 6. Rerunning after config changes
 
-PCA and GMM caches carry configuration fingerprints. If languages, reference-data settings, model identity/revision, sampling settings or PCA configuration change, stale PCA/GMM caches are rebuilt rather than reused silently. Use `--force-refit-pca` or `--force-refit-gmm` to force an otherwise valid cache to be recomputed.
+PCA and GMM caches carry configuration fingerprints. If languages, reference-data settings, model identity/revision, attention backend, sampling settings or PCA configuration change, stale PCA/GMM caches are rebuilt rather than reused silently. GMM keys also include input truncation and selected Aya text/ID content. The mask-relative position fix invalidates earlier fits. Use `--force-refit-pca` or `--force-refit-gmm` to force an otherwise valid cache to be recomputed.
+
+## 7. B200 runs and deferred POS
+
+Use `configs/b200_config.yaml` with a Blackwell-compatible PyTorch/CUDA build. It preserves model selections and experimental token/sample limits, uses BF16, removes batch-1 overrides for the optional 8B models, and writes to `outputs/b200/`.
+
+```bash
+python scripts/run_experiment.py --config configs/b200_config.yaml
+python scripts/annotate_outputs.py --config configs/b200_config.yaml
+```
+
+The second command needs CPU/Stanza but no model/GPU, and can run later on a CPU worker sharing the output directory. It fills deferred POS fields in the token Parquet files and writes POS summaries. Keep `lexical_analysis.deferred: false` when inline tagging is desired. See the [README B200 section](README.md#b200) for batch tuning, performance logs and regression tests.

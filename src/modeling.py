@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -87,6 +88,8 @@ def load_model(model_key: str, spec: dict[str, Any], runtime: dict[str, Any]) ->
     dtype = _dtype(spec.get("torch_dtype", "auto"))
     # torch_dtype remains broadly compatible across Transformers releases.
     kwargs["torch_dtype"] = dtype
+    if spec.get("attn_implementation") is not None:
+        kwargs["attn_implementation"] = spec["attn_implementation"]
 
     model = AutoModelForCausalLM.from_pretrained(spec["model_name"], **kwargs)
     model.to(device)
@@ -108,6 +111,48 @@ def load_model(model_key: str, spec: dict[str, Any], runtime: dict[str, Any]) ->
 
 def _base_model(model):
     return getattr(model, "base_model", model)
+
+
+def _supports_position_ids(body) -> bool:
+    """Inspect once per model; BLOOM derives ALiBi positions from its mask."""
+    cached = getattr(body, "_multilingual_supports_position_ids", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        parameters = inspect.signature(body.forward).parameters
+    except (TypeError, ValueError):
+        supported = True
+    else:
+        supported = "position_ids" in parameters
+        if not supported and any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            # Wrapped/custom forwards may accept the argument through **kwargs.
+            # BLOOM's **deprecated_arguments does not implement position_ids.
+            supported = getattr(getattr(body, "config", None), "model_type", None) != "bloom"
+    body._multilingual_supports_position_ids = supported
+    return supported
+
+
+def _forward_hidden_states(loaded: LoadedModel, model_inputs: dict[str, torch.Tensor], runtime: dict[str, Any]):
+    """Use identical, mask-relative token positions in every representation pass."""
+    body = _base_model(loaded.model)
+    inputs = dict(model_inputs)
+    if _supports_position_ids(body):
+        mask = inputs["attention_mask"]
+        positions = mask.long().cumsum(dim=-1) - 1
+        positions.masked_fill_(mask == 0, 0)
+        inputs["position_ids"] = positions
+    with _precision_context(loaded.device, runtime):
+        try:
+            out = body(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
+        except TypeError as exc:
+            # Some wrapped models hide their signature. Cache the discovery so
+            # subsequent batches do not pay for an unsupported-argument retry.
+            if "position_ids" not in inputs or "unexpected keyword" not in str(exc) or "position_ids" not in str(exc):
+                raise
+            body._multilingual_supports_position_ids = False
+            inputs.pop("position_ids")
+            out = body(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
+    return list(out.hidden_states)
 
 
 def _format_inputs(loaded: LoadedModel, prompts: list[str]) -> list[str]:
@@ -144,12 +189,9 @@ def _forward_on_device(
     runtime: dict[str, Any],
 ):
     tok = _tokenize(loaded, texts, max_tokens)
-    body = _base_model(loaded.model)
-    with _precision_context(loaded.device, runtime):
-        out = body(**tok, output_hidden_states=True, return_dict=True, use_cache=False)
-    hidden_states = list(out.hidden_states)
+    hidden_states = _forward_hidden_states(loaded, tok, runtime)
     mask = tok["attention_mask"].bool()
-    del out, tok
+    del tok
     return hidden_states, mask
 
 
@@ -198,15 +240,8 @@ def forward_texts_with_offsets(
     attention_mask = enc["attention_mask"].cpu().tolist()
     offsets = [[(int(a), int(b)) for a, b in row] for row in offsets_raw]
     model_inputs = {k: v.to(loaded.device, non_blocking=True) for k, v in enc.items()}
-    with _precision_context(loaded.device, runtime):
-        out = _base_model(loaded.model)(
-            **model_inputs,
-            output_hidden_states=True,
-            return_dict=True,
-            use_cache=False,
-        )
-    hidden_states = list(out.hidden_states)
-    del out, enc, model_inputs
+    hidden_states = _forward_hidden_states(loaded, model_inputs, runtime)
+    del enc, model_inputs
     return hidden_states, input_ids, offsets, attention_mask
 
 
@@ -351,63 +386,40 @@ def forward_generated_texts_with_context(
     if pad_token_id is None:
         raise RuntimeError(f"Tokenizer for {loaded.name} needs a pad_token_id for batched context forwarding.")
 
+    sequence_lengths = torch.tensor([len(sequence) for sequence in sequences], dtype=torch.long)
+    left_padding = max_sequence_len - sequence_lengths
     ids_tensor = torch.full((batch_size, max_sequence_len), int(pad_token_id), dtype=torch.long)
-    mask_tensor = torch.zeros((batch_size, max_sequence_len), dtype=torch.long)
-    position_tensor = torch.zeros((batch_size, max_sequence_len), dtype=torch.long)
-    left_padding: list[int] = []
-    for i, sequence in enumerate(sequences):
-        pad_len = max_sequence_len - len(sequence)
-        left_padding.append(pad_len)
-        if sequence:
-            ids_tensor[i, pad_len:] = torch.tensor(sequence, dtype=torch.long)
-            mask_tensor[i, pad_len:] = 1
-            position_tensor[i, pad_len:] = torch.arange(len(sequence), dtype=torch.long)
+    # Scatter all variable-length sequences at once rather than assigning one
+    # padded row at a time. Token lists are already on CPU for offset alignment.
+    flat_ids = torch.tensor([token for sequence in sequences for token in sequence], dtype=torch.long)
+    sample_indices = torch.arange(batch_size).repeat_interleave(sequence_lengths)
+    sequence_starts = (sequence_lengths.cumsum(0) - sequence_lengths).repeat_interleave(sequence_lengths)
+    token_columns = torch.arange(flat_ids.numel()) - sequence_starts + left_padding[sample_indices]
+    ids_tensor[sample_indices, token_columns] = flat_ids
+    mask_tensor = (torch.arange(max_sequence_len)[None, :] >= left_padding[:, None]).long()
 
     model_inputs = {
         "input_ids": ids_tensor.to(loaded.device, non_blocking=True),
         "attention_mask": mask_tensor.to(loaded.device, non_blocking=True),
-        "position_ids": position_tensor.to(loaded.device, non_blocking=True),
     }
-    body = _base_model(loaded.model)
-    with _precision_context(loaded.device, runtime):
-        try:
-            out = body(
-                **model_inputs,
-                output_hidden_states=True,
-                return_dict=True,
-                use_cache=False,
-            )
-        except TypeError as exc:
-            # Some architectures (notably ALiBi-based BLOOM) do not accept explicit
-            # position_ids. Relative-position models can omit them safely.
-            if "position_ids" not in str(exc):
-                raise
-            model_inputs.pop("position_ids", None)
-            out = body(
-                **model_inputs,
-                output_hidden_states=True,
-                return_dict=True,
-                use_cache=False,
-            )
-    full_hidden_states = list(out.hidden_states)
+    full_hidden_states = _forward_hidden_states(loaded, model_inputs, runtime)
 
     max_output_len = max((len(ids) for ids in output_token_ids), default=0)
+    output_lengths = torch.tensor([len(ids) for ids in output_token_ids], device=loaded.device)
+    output_positions = torch.arange(max_output_len, device=loaded.device)[None, :]
+    valid_output = output_positions < output_lengths[:, None]
+    # Continuations end at the right edge of every left-padded full sequence.
+    gather_positions = max_sequence_len - output_lengths[:, None] + output_positions
+    gather_positions = gather_positions.clamp(max=max(max_sequence_len - 1, 0))
     output_hidden_states: list[torch.Tensor] = []
     for full_hidden in full_hidden_states:
-        output_hidden = torch.zeros(
-            (batch_size, max_output_len, full_hidden.shape[-1]),
-            device=full_hidden.device,
-            dtype=full_hidden.dtype,
+        output_hidden = full_hidden.gather(
+            1, gather_positions[:, :, None].expand(-1, -1, full_hidden.shape[-1])
         )
-        for i, (prompt_ids, out_ids) in enumerate(zip(prompt_token_ids, output_token_ids)):
-            if not out_ids:
-                continue
-            start = left_padding[i] + len(prompt_ids)
-            end = start + len(out_ids)
-            output_hidden[i, :len(out_ids), :] = full_hidden[i, start:end, :]
+        output_hidden.masked_fill_(~valid_output[:, :, None], 0)
         output_hidden_states.append(output_hidden)
 
-    del out, full_hidden_states, model_inputs, ids_tensor, mask_tensor, position_tensor
+    del full_hidden_states, model_inputs, ids_tensor, mask_tensor
     return output_hidden_states, output_token_ids, output_offsets, output_attention
 
 

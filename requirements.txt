@@ -1,4 +1,5 @@
 torch>=2.3
+numpy>=1.24
 transformers>=4.51.0
 datasets>=3.0
 pandas>=2.0

@@ -83,6 +83,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
         overrides = spec.get("runtime_overrides", {})
         if not isinstance(overrides, dict):
             raise ConfigError(f"models.{name}.runtime_overrides must be a mapping.")
+        for key in ("wikipedia_batch_size", "evaluation_batch_size", "generation_batch_size", "max_input_tokens", "posterior_batch_size"):
+            if key in overrides:
+                _positive_int(overrides[key], f"models.{name}.runtime_overrides.{key}")
+        attention = spec.get("attn_implementation")
+        if attention is not None and (not isinstance(attention, str) or not attention.strip()):
+            raise ConfigError(f"models.{name}.attn_implementation must be a non-empty string.")
     if not enabled_models:
         raise ConfigError("At least one model must be enabled.")
 
@@ -94,6 +100,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ConfigError("This implementation requires one diagonal Gaussian per language/layer.")
     if float(rep.get("gmm_reg_covar", 0.0)) <= 0:
         raise ConfigError("representation.gmm_reg_covar must be positive.")
+    if not isinstance(rep.get("equal_language_priors", False), bool):
+        raise ConfigError("representation.equal_language_priors must be true or false.")
 
     gen = cfg["generation"]
     _positive_int(gen.get("max_new_tokens"), "generation.max_new_tokens")
@@ -106,6 +114,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
     runtime = cfg["runtime"]
     for key in ("evaluation_batch_size", "wikipedia_batch_size", "generation_batch_size", "max_input_tokens"):
         _positive_int(runtime.get(key), f"runtime.{key}")
+    _positive_int(runtime.get("posterior_batch_size", 512), "runtime.posterior_batch_size")
+    gc_interval = runtime.get("gc_collect_every_batches", 0)
+    if isinstance(gc_interval, bool) or not isinstance(gc_interval, int) or gc_interval < 0:
+        raise ConfigError("runtime.gc_collect_every_batches must be a non-negative integer.")
+    if not isinstance(runtime.get("log_performance", False), bool):
+        raise ConfigError("runtime.log_performance must be true or false.")
     if runtime.get("require_gpu", False) and runtime.get("device", "cuda") not in {"cuda", "gpu", "auto"}:
         raise ConfigError("GPU-only runtime.device must be cuda, gpu, or auto.")
     mixed_precision = str(runtime.get("mixed_precision", "fp16")).lower()
@@ -115,6 +129,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
     lexical = cfg.get("lexical_analysis", {})
     if not isinstance(lexical.get("enabled", True), bool):
         raise ConfigError("lexical_analysis.enabled must be true or false.")
+    for key, default in (("deferred", False), ("save_pos_posterior_summary", True)):
+        if not isinstance(lexical.get(key, default), bool):
+            raise ConfigError(f"lexical_analysis.{key} must be true or false.")
     spectral = cfg.get("spectral_embedding", {})
     if spectral.get("enabled", True):
         _positive_int(spectral.get("n_components", 2), "spectral_embedding.n_components")

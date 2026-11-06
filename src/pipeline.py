@@ -3,10 +3,13 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterator
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -50,6 +53,18 @@ from .pca_gpu import (
 )
 
 
+_PANDAS_STRING_TYPE = pa.array(pd.Series([""])).type
+
+
+def _columnar_table(columns: dict[str, Any]) -> pa.Table:
+    """Keep pandas' string schema convention without a high-volume DataFrame."""
+    arrays = {}
+    for name, values in columns.items():
+        first = next((value for value in values if value is not None), None)
+        arrays[name] = pa.array(values, type=_PANDAS_STRING_TYPE) if isinstance(first, str) else values
+    return pa.table(arrays)
+
+
 class PartitionWriter:
     """Append row batches to one compressed Parquet file."""
 
@@ -65,6 +80,12 @@ class PartitionWriter:
             pd.DataFrame(rows),
             preserve_index=False,
         )
+        self.write_table(table)
+
+    def write_table(self, table: pa.Table) -> None:
+        """Append an Arrow batch without constructing per-row Python dictionaries."""
+        if table.num_rows == 0:
+            return
 
         if self.writer is None:
             self.path.parent.mkdir(
@@ -91,11 +112,14 @@ def _model_revision(loaded: LoadedModel) -> str | None:
 
 def _pca_fingerprint(cfg: dict[str, Any], loaded: LoadedModel) -> str:
     payload = {
+        "implementation_version": "b200-analysis-v1",
+        "position_policy": "attention-mask-relative-v1",
         "model_key": loaded.name,
         "model_name": loaded.spec.get("model_name"),
         "model_revision": _model_revision(loaded),
         "torch_dtype": loaded.spec.get("torch_dtype", "auto"),
         "mixed_precision": cfg["runtime"].get("mixed_precision", "fp16"),
+        "attn_implementation": loaded.spec.get("attn_implementation"),
         "trust_remote_code": bool(cfg["runtime"].get("trust_remote_code", False)),
         "languages": list(cfg["languages"]),
         "project_seed": int(cfg["project"].get("seed", 42)),
@@ -113,6 +137,34 @@ def _pca_fingerprint(cfg: dict[str, Any], loaded: LoadedModel) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _aya_content_fingerprints(cfg: dict[str, Any]) -> dict[str, str]:
+    """Hash the selected, cleaned input rows rather than only their counts/paths."""
+    hashes = {}
+    columns = [cfg["data"]["sample_id_column"], cfg["data"]["input_column"]]
+    for language in cfg["languages"]:
+        digest = hashlib.sha256()
+        for chunk in iter_aya_batches(cfg, language, 1024):
+            for sample_id, text in chunk[columns].itertuples(index=False, name=None):
+                encoded = json.dumps([str(sample_id), str(text)], ensure_ascii=False).encode("utf-8")
+                digest.update(encoded)
+                digest.update(b"\n")
+        hashes[language] = digest.hexdigest()
+    return hashes
+
+
+def _prior_type(cfg: dict[str, Any]) -> str:
+    return "uniform" if cfg["representation"].get("equal_language_priors", False) else "empirical_sample_count"
+
+
+def _configured_language_priors(
+    cfg: dict[str, Any], sample_counts: dict[str, int], device: torch.device
+) -> torch.Tensor:
+    languages = list(cfg["languages"])
+    if cfg["representation"].get("equal_language_priors", False):
+        return torch.full((len(languages),), 1.0 / len(languages), device=device, dtype=torch.float32)
+    return build_language_priors(languages, sample_counts, device)
+
+
 def _gmm_fingerprint(
     cfg: dict[str, Any], loaded: LoadedModel, expected_sample_counts: dict[str, int]
 ) -> str:
@@ -125,8 +177,10 @@ def _gmm_fingerprint(
         "aya_sample_cap": int(cfg["data"].get("max_samples_per_language", 2000)),
         "sampling_seed": int(cfg["data"].get("sampling_seed", cfg["project"].get("seed", 42))),
         "sample_counts": {k: int(v) for k, v in expected_sample_counts.items()},
+        "aya_content": _aya_content_fingerprints(cfg),
+        "max_input_tokens": cfg["runtime"].get("max_input_tokens"),
         "gmm_reg_covar": float(cfg["representation"].get("gmm_reg_covar", 1e-6)),
-        "prior_type": "empirical_sample_count",
+        "prior_type": _prior_type(cfg),
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -577,19 +631,11 @@ def _fit_aya_gmms(
     # Empirical language priors
     # --------------------------------------------------------
 
-    language_priors = (
-        build_language_priors(
-            languages=languages,
-            sample_counts=(
-                expected_sample_counts
-            ),
-            device=loaded.device,
-        )
-    )
+    language_priors = _configured_language_priors(cfg, expected_sample_counts, loaded.device)
 
     print(
         f"[{loaded.name}] "
-        f"Empirical language priors:"
+        f"Language priors ({_prior_type(cfg)}):"
     )
 
     for language, prior in zip(
@@ -726,11 +772,7 @@ def _fit_aya_gmms(
         ),
         "languages": languages,
 
-        # Important:
-        # priors are NOT uniform.
-        "prior_type": (
-            "empirical_sample_count"
-        ),
+        "prior_type": _prior_type(cfg),
 
         "sample_counts": {
             language: int(
@@ -864,7 +906,7 @@ def _load_gmms_or_fit(
 
             same_prior_type = (
                 meta.get("prior_type")
-                == "empirical_sample_count"
+                == _prior_type(cfg)
             )
 
             same_sample_counts = (
@@ -938,6 +980,51 @@ def _load_gmms_or_fit(
 # ANALYSIS
 # ============================================================
 
+def _batch_posteriors(
+    hidden_states: list[torch.Tensor],
+    pcas: list[GPUPCA],
+    gmms: list[GPULanguageGMM],
+    sample_indices: list[int],
+    sequence_positions: list[int],
+    posterior_batch_size: int,
+    n_languages: int,
+) -> np.ndarray:
+    """Gather token vectors in batches and copy all layer posteriors to CPU once."""
+    n_layers = min(len(hidden_states), len(pcas), len(gmms))
+    if not sample_indices or n_layers == 0:
+        return np.empty((n_layers, len(sample_indices), n_languages), dtype=np.float32)
+    device = hidden_states[0].device
+    sample_index = torch.tensor(sample_indices, dtype=torch.long, device=device)
+    sequence_index = torch.tensor(sequence_positions, dtype=torch.long, device=device)
+    layer_posteriors = []
+    for layer in range(n_layers):
+        vectors = hidden_states[layer][sample_index, sequence_index]
+        projected = pcas[layer].transform(vectors)
+        parts = [
+            gmms[layer].posterior(projected[start:start + posterior_batch_size])
+            for start in range(0, len(sample_indices), posterior_batch_size)
+        ]
+        layer_posteriors.append(torch.cat(parts, dim=0))
+    return torch.stack(layer_posteriors).detach().cpu().numpy()
+
+
+@contextmanager
+def _measure_phase(performance: dict[str, Any] | None, phase: str, device: torch.device):
+    """Synchronize only at optional measurement boundaries, never per batch."""
+    if performance is None:
+        yield
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        performance["phase_seconds"][phase] = perf_counter() - started
+
+
 def _analyze_model(
     cfg: dict[str, Any],
     loaded: LoadedModel,
@@ -949,6 +1036,9 @@ def _analyze_model(
     result_dir.mkdir(parents=True, exist_ok=True)
     gen_cfg = cfg["generation"]
     batch_size = int(cfg["runtime"].get("generation_batch_size", 1))
+    posterior_batch_size = int(cfg["runtime"].get("posterior_batch_size", 512))
+    gc_interval = int(cfg["runtime"].get("gc_collect_every_batches", 0))
+    batches_processed = 0
     languages = list(cfg["languages"])
     posterior_columns = [f"P_{language}" for language in languages]
 
@@ -956,14 +1046,18 @@ def _analyze_model(
     sentence_writers: dict[str, PartitionWriter] = {}
     output_writers: dict[str, PartitionWriter] = {}
     counts = {lang: 0 for lang in languages}
+    generated_token_count = 0
+    analyzed_token_count = 0
 
     lexical_cfg = dict(cfg.get("lexical_analysis", {}))
     lexical_enabled = bool(lexical_cfg.get("enabled", True))
+    lexical_deferred = lexical_enabled and bool(lexical_cfg.get("deferred", False))
+    save_pos_summary = bool(lexical_cfg.get("save_pos_posterior_summary", True)) and not lexical_deferred
     stanza_dir = Path(lexical_cfg.get("stanza_model_dir", "outputs/stanza_resources"))
     if not stanza_dir.is_absolute():
         stanza_dir = Path(cfg.get("_repo_root", Path.cwd())) / stanza_dir
     lexical_cfg["stanza_model_dir"] = str(stanza_dir)
-    tagger = StanzaTagger(lexical_cfg) if lexical_enabled else None
+    tagger = StanzaTagger(lexical_cfg) if lexical_enabled and not lexical_deferred else None
 
     try:
         print(f"[{loaded.name}] Aya pass 2/2: generation + token posterior/POS analysis")
@@ -971,6 +1065,9 @@ def _analyze_model(
         for language in languages:
             # Keep only small aggregates in memory; all token rows are streamed to Parquet.
             pos_buckets: dict[tuple[int, str, str], dict[str, Any]] = {}
+            summary_path = result_dir / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
+            if not save_pos_summary and summary_path.exists():
+                summary_path.unlink()  # A previous run's summary must not look current.
 
             for chunk in tqdm(
                 iter_aya_batches(cfg, language, batch_size),
@@ -983,19 +1080,17 @@ def _analyze_model(
                     loaded, prompts, gen_cfg, cfg["runtime"]
                 )
                 counts[language] += len(sample_ids)
-                output_rows = [
-                    {
-                        "model": loaded.name,
-                        "sample_id": sid,
-                        "input_language": language,
-                        "prompt": prompt,
-                        "generated_text": text,
-                        "generated_token_count": len(ids),
-                    }
-                    for sid, prompt, text, ids in zip(sample_ids, prompts, generated_texts, generated_ids)
-                ]
+                generated_token_count += sum(len(ids) for ids in generated_ids)
+                output_table = _columnar_table({
+                    "model": [loaded.name] * len(sample_ids),
+                    "sample_id": sample_ids,
+                    "input_language": [language] * len(sample_ids),
+                    "prompt": prompts,
+                    "generated_text": generated_texts,
+                    "generated_token_count": [len(ids) for ids in generated_ids],
+                })
                 outputs_path = result_dir / "generated_outputs" / f"{language}.parquet"
-                output_writers.setdefault(language, PartitionWriter(outputs_path)).write(output_rows)
+                output_writers.setdefault(language, PartitionWriter(outputs_path)).write_table(output_table)
 
                 # A separate teacher-forced forward pass gives each output token its own
                 # contextual hidden state; generation-time step states predict the next token.
@@ -1011,6 +1106,8 @@ def _analyze_model(
                 for sample_idx, text in enumerate(generated_texts):
                     if tagger is not None and text.strip():
                         words, tag_status = tagger.tag_text(text, language)
+                    elif lexical_deferred:
+                        words, tag_status = [], "deferred"
                     elif not lexical_enabled:
                         words, tag_status = [], "disabled"
                     else:
@@ -1047,116 +1144,107 @@ def _analyze_model(
                         })
                     per_sample_refs.append(refs)
 
-                sentence_rows: list[dict[str, Any]] = []
-                all_token_rows: list[dict[str, Any]] = []
+                flat_refs = [ref for refs in per_sample_refs for ref in refs]
+                n_tokens = len(flat_refs)
+                analyzed_token_count += n_tokens
                 n_layers = min(len(hidden_states), len(pcas), len(gmms))
+                token_counts = [len(refs) for refs in per_sample_refs]
+                token_starts = np.cumsum([0, *token_counts])
+                all_posteriors = _batch_posteriors(
+                    hidden_states, pcas, gmms,
+                    [ref["sample_index"] for ref in flat_refs],
+                    [ref["sequence_position"] for ref in flat_refs],
+                    posterior_batch_size, len(languages),
+                )
+                # These Arrow arrays are built once and reused by every layer table.
+                metadata_table = None
+                pos_groups: dict[tuple[str, str], list[int]] = {}
+                if n_tokens:
+                    metadata_columns = {
+                        "model": [loaded.name] * n_tokens,
+                        "sample_id": [sample_ids[ref["sample_index"]] for ref in flat_refs],
+                        "input_language": [language] * n_tokens,
+                        "token_position": [position for refs in per_sample_refs for position in range(len(refs))],
+                    }
+                    for key in (
+                        "sequence_position", "token", "model_token", "token_id", "char_start", "char_end",
+                        "word_text", "sentence_id", "word_id", "upos", "xpos", "feats", "pos_status",
+                    ):
+                        metadata_columns[key] = [ref[key] for ref in flat_refs]
+                    metadata_table = _columnar_table(metadata_columns)
+                    if save_pos_summary:
+                        for index, ref in enumerate(flat_refs):
+                            key = (str(ref["upos"]), str(ref["pos_status"]))
+                            pos_groups.setdefault(key, []).append(index)
 
+                token_tables = []
+                sentence_tables = []
                 for layer in range(n_layers):
-                    flat_refs = [ref for refs in per_sample_refs for ref in refs]
-                    if not flat_refs:
-                        for sample_idx, (sid, _text) in enumerate(zip(sample_ids, generated_texts)):
-                            sentence_rows.append({
-                                "model": loaded.name,
-                                "sample_id": sid,
-                                "input_language": language,
-                                "layer": layer,
-                                "num_output_tokens": 0,
-                                **{col: 0.0 for col in posterior_columns},
-                            })
-                        continue
+                    values = all_posteriors[layer]
+                    if metadata_table is not None:
+                        table = metadata_table.append_column("layer", pa.array([layer] * n_tokens))
+                        for index, column in enumerate(posterior_columns):
+                            table = table.append_column(column, pa.array(values[:, index], type=pa.float64()))
+                        token_tables.append(table)
 
-                    vectors = torch.stack([
-                        hidden_states[layer][ref["sample_index"], ref["sequence_position"], :]
-                        for ref in flat_refs
-                    ])
-                    projected = pcas[layer].transform(vectors)
-                    # Bound temporary [N, language, PCA-dimension] posterior tensors.
-                    post_parts = [
-                        gmms[layer].posterior(projected[i:i + 512])
-                        for i in range(0, projected.shape[0], 512)
-                    ]
-                    posterior = torch.cat(post_parts, dim=0) if post_parts else projected.new_empty((0, len(languages)))
-                    post_values = posterior.detach().cpu().tolist()
-                    del vectors, projected, post_parts, posterior
+                    # Accumulate in float64, matching the previous Python float sums.
+                    sentence_values = np.zeros((len(sample_ids), len(languages)), dtype=np.float64)
+                    for sample_idx, count in enumerate(token_counts):
+                        if count:
+                            start, end = token_starts[sample_idx:sample_idx + 2]
+                            sentence_values[sample_idx] = values[start:end].sum(axis=0, dtype=np.float64) / count
+                    sentence_columns = {
+                        "model": [loaded.name] * len(sample_ids),
+                        "sample_id": sample_ids,
+                        "input_language": [language] * len(sample_ids),
+                        "layer": [layer] * len(sample_ids),
+                        "num_output_tokens": token_counts,
+                    }
+                    for index, column in enumerate(posterior_columns):
+                        sentence_columns[column] = sentence_values[:, index]
+                    sentence_tables.append(_columnar_table(sentence_columns))
 
-                    sample_posteriors: list[list[list[float]]] = [[] for _ in sample_ids]
-                    for ref, values in zip(flat_refs, post_values):
-                        sample_idx = ref["sample_index"]
-                        row = {
+                    for (upos, status), indices in pos_groups.items():
+                        bucket = pos_buckets.setdefault(
+                            (layer, upos, status),
+                            {"n": 0, "sums": {column: 0.0 for column in posterior_columns}},
+                        )
+                        bucket["n"] += len(indices)
+                        sums = values[indices].sum(axis=0, dtype=np.float64)
+                        for column, value in zip(posterior_columns, sums):
+                            bucket["sums"][column] += float(value)
+
+                if token_tables:
+                    token_path = result_dir / "token_posteriors" / f"{language}.parquet"
+                    token_writers.setdefault(language, PartitionWriter(token_path)).write_table(pa.concat_tables(token_tables))
+                if sentence_tables:
+                    sentence_path = result_dir / "sentence_level_posteriors" / f"{language}.parquet"
+                    sentence_writers.setdefault(language, PartitionWriter(sentence_path)).write_table(pa.concat_tables(sentence_tables))
+                del hidden_states, per_sample_refs, flat_refs, all_posteriors
+                batches_processed += 1
+                if gc_interval and batches_processed % gc_interval == 0:
+                    gc.collect()
+
+            if save_pos_summary:
+                # Small per-POS aggregation: average posterior probability for each candidate
+                # language by layer and Stanza UPOS tag. The detailed token rows remain in Parquet.
+                summary_rows: list[dict[str, Any]] = []
+                for (layer, upos, status), bucket in sorted(pos_buckets.items()):
+                    n_tokens = int(bucket["n"])
+                    for candidate_language in languages:
+                        col = f"P_{candidate_language}"
+                        summary_rows.append({
                             "model": loaded.name,
-                            "sample_id": sample_ids[sample_idx],
-                            "input_language": language,
-                            "token_position": len(sample_posteriors[sample_idx]),
-                            "sequence_position": ref["sequence_position"],
-                            "token": ref["token"],
-                            "model_token": ref["model_token"],
-                            "token_id": ref["token_id"],
-                            "char_start": ref["char_start"],
-                            "char_end": ref["char_end"],
-                            "word_text": ref["word_text"],
-                            "sentence_id": ref["sentence_id"],
-                            "word_id": ref["word_id"],
-                            "upos": ref["upos"],
-                            "xpos": ref["xpos"],
-                            "feats": ref["feats"],
-                            "pos_status": ref["pos_status"],
-                            "layer": layer,
-                        }
-                        row.update({col: float(value) for col, value in zip(posterior_columns, values)})
-                        sample_posteriors[sample_idx].append(values)
-                        all_token_rows.append(row)
-
-                        key = (layer, str(ref["upos"]), str(ref["pos_status"]))
-                        bucket = pos_buckets.setdefault(key, {"n": 0, "sums": {col: 0.0 for col in posterior_columns}})
-                        bucket["n"] += 1
-                        for col, value in zip(posterior_columns, values):
-                            bucket["sums"][col] += float(value)
-
-                    for sample_idx, sid in enumerate(sample_ids):
-                        sample_values = sample_posteriors[sample_idx]
-                        if sample_values:
-                            n_values = len(sample_values)
-                            means = [sum(vals[j] for vals in sample_values) / n_values for j in range(len(languages))]
-                        else:
-                            n_values = 0
-                            means = [0.0] * len(languages)
-                        sentence_rows.append({
-                            "model": loaded.name,
-                            "sample_id": sid,
                             "input_language": language,
                             "layer": layer,
-                            "num_output_tokens": n_values,
-                            **{col: float(value) for col, value in zip(posterior_columns, means)},
+                            "upos": upos,
+                            "pos_status": status,
+                            "posterior_language": candidate_language,
+                            "num_tokens": n_tokens,
+                            "mean_posterior": bucket["sums"][col] / max(n_tokens, 1),
                         })
-
-                token_path = result_dir / "token_posteriors" / f"{language}.parquet"
-                token_writers.setdefault(language, PartitionWriter(token_path)).write(all_token_rows)
-                sentence_path = result_dir / "sentence_level_posteriors" / f"{language}.parquet"
-                sentence_writers.setdefault(language, PartitionWriter(sentence_path)).write(sentence_rows)
-
-                del hidden_states, per_sample_refs, all_token_rows, sentence_rows
-                gc.collect()
-
-            # Small per-POS aggregation: average posterior probability for each candidate
-            # language by layer and Stanza UPOS tag. The detailed token rows remain in Parquet.
-            summary_rows: list[dict[str, Any]] = []
-            for (layer, upos, status), bucket in sorted(pos_buckets.items()):
-                n_tokens = int(bucket["n"])
-                for candidate_language in languages:
-                    col = f"P_{candidate_language}"
-                    summary_rows.append({
-                        "model": loaded.name,
-                        "input_language": language,
-                        "layer": layer,
-                        "upos": upos,
-                        "pos_status": status,
-                        "posterior_language": candidate_language,
-                        "num_tokens": n_tokens,
-                        "mean_posterior": bucket["sums"][col] / max(n_tokens, 1),
-                    })
-            summary_path = result_dir / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+                summary_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
             if tagger is not None:
                 # Only one source-language Stanza pipeline is retained at a time.
                 tagger.close()
@@ -1172,6 +1260,13 @@ def _analyze_model(
         {"language": lang, "num_samples_analyzed": count}
         for lang, count in counts.items()
     ]).to_csv(result_dir / "analysis_counts.csv", index=False)
+    return {
+        "samples_analyzed": sum(counts.values()),
+        "samples_by_language": counts,
+        "generated_tokens": generated_token_count,
+        "analyzed_output_tokens": analyzed_token_count,
+        "generation_batches": batches_processed,
+    }
 
 
 # ============================================================
@@ -1231,26 +1326,35 @@ def run(
         model_runtime.update(model_spec.get("runtime_overrides", {}))
         model_cfg["runtime"] = model_runtime
         loaded = None
+        performance = {"model": model_key, "phase_seconds": {}} if model_runtime.get("log_performance", False) else None
+        model_started = perf_counter()
 
         try:
             loaded = load_model(model_key, model_spec, model_runtime)
+            if performance is not None:
+                torch.cuda.synchronize(loaded.device)
+                performance["phase_seconds"]["model_load"] = perf_counter() - model_started
+                # Current model weights remain included in the new peak baseline.
+                torch.cuda.reset_peak_memory_stats(loaded.device)
             print(
                 f"[{model_key}] GPU allocated after model load: "
                 f"{torch.cuda.memory_allocated(loaded.device) / (1024**3):.2f} GiB"
             )
 
-            pcas = _load_pcas_or_fit(
-                model_cfg, loaded, pca_root, force_refit=force_refit_pca
-            )
-            gmms = _load_gmms_or_fit(
-                model_cfg,
-                loaded,
-                pcas,
-                gmm_root,
-                pca_root,
-                expected_sample_counts,
-                force_refit=force_refit_gmm,
-            )
+            with _measure_phase(performance, "pca", loaded.device):
+                pcas = _load_pcas_or_fit(
+                    model_cfg, loaded, pca_root, force_refit=force_refit_pca
+                )
+            with _measure_phase(performance, "gmm", loaded.device):
+                gmms = _load_gmms_or_fit(
+                    model_cfg,
+                    loaded,
+                    pcas,
+                    gmm_root,
+                    pca_root,
+                    expected_sample_counts,
+                    force_refit=force_refit_gmm,
+                )
 
             result_dir = output_root / cfg["outputs"]["result_dir"] / model_key
             if model_cfg.get("spectral_embedding", {}).get("enabled", True):
@@ -1271,7 +1375,22 @@ def run(
                         encoding="utf-8",
                     )
                     print(f"[{loaded.name}] WARNING: Spectral Embedding failed: {exc}")
-            _analyze_model(model_cfg, loaded, pcas, gmms, result_dir)
+            with _measure_phase(performance, "analysis", loaded.device):
+                analysis_counts = _analyze_model(model_cfg, loaded, pcas, gmms, result_dir)
+            if performance is not None:
+                performance.update(analysis_counts)
+                performance["elapsed_seconds"] = perf_counter() - model_started
+                performance["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(loaded.device)
+                performance["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(loaded.device)
+                performance["peak_scope"] = "After model load, including resident model weights"
+                performance["samples_per_second"] = (
+                    analysis_counts["samples_analyzed"] / max(performance["phase_seconds"]["analysis"], 1e-12)
+                )
+                performance["generation_tokens_per_second_including_analysis"] = (
+                    analysis_counts["generated_tokens"] / max(performance["phase_seconds"]["analysis"], 1e-12)
+                )
+                with (result_dir / "performance.json").open("w", encoding="utf-8") as handle:
+                    json.dump(performance, handle, indent=2)
             del pcas, gmms
             gc.collect()
         except Exception as exc:

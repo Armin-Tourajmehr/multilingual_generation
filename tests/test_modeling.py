@@ -24,6 +24,7 @@ from src.modeling import (
     forward_texts_with_offsets,
     generate_batch,
     load_model,
+    replay_prompt_and_continuation,
 )
 
 
@@ -144,6 +145,38 @@ class ModelingTests(unittest.TestCase):
         self.assertEqual(offsets, [[], []])
         self.assertEqual(attention, [[], []])
         self.assertTrue(all(layer.shape == (2, 0, 16) for layer in hidden))
+
+    def test_full_replay_predecessors_match_generation_step_states(self):
+        prompts = [[1, 2], [3, 4, 5]]
+        inputs = CharacterTokenizer()(["ab", "cde"], return_tensors="pt")
+        for model in (self.gpt, self.bloom):
+            with self.subTest(model=model.config.model_type):
+                with torch.inference_mode():
+                    generated = model.generate(
+                        input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+                        max_new_tokens=3, do_sample=False, eos_token_id=None, pad_token_id=0,
+                        output_hidden_states=True, return_dict_in_generate=True,
+                    )
+                continuation_ids = generated.sequences[:, inputs["input_ids"].shape[1]:].tolist()
+                full_layers, left_padding = replay_prompt_and_continuation(
+                    self.loaded(model), prompts, continuation_ids, self.runtime,
+                )
+                self.assertEqual(left_padding, [1, 0])
+                self.assertEqual(len(generated.hidden_states), 3)
+                self.assertEqual(len(full_layers), len(generated.hidden_states[0]))
+                for step, generation_layers in enumerate(generated.hidden_states):
+                    predecessors = [pad + len(prompt) + step - 1 for pad, prompt in zip(left_padding, prompts)]
+                    for replayed, observed in zip(full_layers, generation_layers):
+                        self.assertEqual(replayed.shape, (2, 6, 16))
+                        torch.testing.assert_close(
+                            replayed[torch.arange(2), predecessors], observed[:, -1], atol=2e-6, rtol=2e-6,
+                        )
+
+    def test_replay_rejects_mismatched_batch_lengths(self):
+        with self.assertRaisesRegex(ValueError, "Prompt IDs and generated IDs must have equal batch lengths"):
+            replay_prompt_and_continuation(self.loaded(), [[1]], [], self.runtime)
+        with self.assertRaisesRegex(ValueError, "Prompt IDs, generated IDs and generated texts must have equal batch lengths"):
+            forward_generated_texts_with_context(self.loaded(), [[1]], [[2]], [], self.runtime)
 
     def test_replay_consumes_original_byte_tokens_and_control_ids_after_round_trip_mismatch(self):
         backend = Tokenizer(models.BPE(

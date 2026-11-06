@@ -36,14 +36,14 @@ from .modeling import (
     LoadedModel,
     forward_text_batch,
     generate_batch,
-    forward_generated_texts_with_context,
     load_model,
+    replay_prompt_and_continuation,
     release_model,
 )
 
 from .lexical import StanzaTagger, align_pos_to_token
 from .manifold import save_language_manifold
-from .token_alignment import tokenizer_special_ids
+from .token_alignment import align_generated_token_offsets, tokenizer_special_ids
 
 from .pca_gpu import (
     GPUPCA,
@@ -83,9 +83,9 @@ class PartitionWriter:
         )
         self.write_table(table)
 
-    def write_table(self, table: pa.Table) -> None:
+    def write_table(self, table: pa.Table, *, allow_empty: bool = False) -> None:
         """Append an Arrow batch without constructing per-row Python dictionaries."""
-        if table.num_rows == 0:
+        if table.num_rows == 0 and not allow_empty:
             return
 
         if self.writer is None:
@@ -1022,6 +1022,45 @@ def _batch_posteriors(
     return torch.stack(layer_posteriors).detach().cpu().numpy()
 
 
+def _state_posterior_table(
+    model: str,
+    language: str,
+    sample_ids: pa.Array | pa.ChunkedArray,
+    rows: list[tuple[int, int, int, int]],
+    posteriors: np.ndarray,
+    posterior_columns: list[str],
+    contexts: list[tuple[str, int, int]] | None = None,
+) -> pa.Table:
+    """Build one batch of a prompt or predecessor view from shared scores."""
+    sample_indices, positions, token_ids, score_rows = zip(*rows) if rows else ((), (), (), ())
+    columns = {
+        "model": pa.array([model] * len(rows), type=_PANDAS_STRING_TYPE),
+        "sample_id": sample_ids.take(pa.array(sample_indices, type=pa.int64())),
+        "input_language": pa.array([language] * len(rows), type=_PANDAS_STRING_TYPE),
+        "sequence_position": pa.array(positions, type=pa.int64()),
+        "token_id": pa.array(token_ids, type=pa.int64()),
+    }
+    if contexts is not None:
+        segments, context_positions, context_ids = zip(*contexts) if contexts else ((), (), ())
+        columns.update(
+            context_segment=pa.array(segments, type=_PANDAS_STRING_TYPE),
+            context_position=pa.array(context_positions, type=pa.int64()),
+            context_token_id=pa.array(context_ids, type=pa.int64()),
+        )
+    metadata = pa.table(columns)
+
+    def layer_table(layer: int, values: np.ndarray) -> pa.Table:
+        table = metadata.append_column("layer", pa.array([layer] * len(rows), type=pa.int64()))
+        for index, column in enumerate(posterior_columns):
+            table = table.append_column(column, pa.array(values[:, index], type=pa.float32()))
+        return table
+
+    if not rows:
+        return layer_table(0, np.empty((0, len(posterior_columns)), dtype=np.float32))
+    indices = np.asarray(score_rows, dtype=np.intp)
+    return pa.concat_tables([layer_table(layer, values[indices]) for layer, values in enumerate(posteriors)])
+
+
 @contextmanager
 def _measure_phase(performance: dict[str, Any] | None, phase: str, device: torch.device):
     """Synchronize only at optional measurement boundaries, never per batch."""
@@ -1046,7 +1085,7 @@ def _analyze_model(
     gmms: list[GPULanguageGMM],
     result_dir: Path,
 ):
-    """Replay generated IDs for post-emission states and attach optional POS spans."""
+    """Score prompt, predecessor, and post-emission states from one ID replay."""
     result_dir.mkdir(parents=True, exist_ok=True)
     gen_cfg = cfg["generation"]
     batch_size = int(cfg["runtime"].get("generation_batch_size", 1))
@@ -1060,6 +1099,8 @@ def _analyze_model(
     token_writers: dict[str, PartitionWriter] = {}
     sentence_writers: dict[str, PartitionWriter] = {}
     output_writers: dict[str, PartitionWriter] = {}
+    prompt_writers: dict[str, PartitionWriter] = {}
+    preceding_writers: dict[str, PartitionWriter] = {}
     counts = {lang: 0 for lang in languages}
     generated_token_count = 0
     analyzed_token_count = 0
@@ -1080,6 +1121,14 @@ def _analyze_model(
         for language in languages:
             # Keep only small aggregates in memory; all token rows are streamed to Parquet.
             pos_buckets: dict[tuple[int, str, str], dict[str, Any]] = {}
+            prompt_writer = prompt_writers[language] = PartitionWriter(
+                result_dir / "prompt_token_posteriors" / f"{language}.parquet"
+            )
+            preceding_writer = preceding_writers[language] = PartitionWriter(
+                result_dir / "preceding_token_posteriors" / f"{language}.parquet"
+            )
+            token_path = result_dir / "token_posteriors" / f"{language}.parquet"
+            sample_id_type = pa.int64()
             summary_path = result_dir / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
             if not save_pos_summary and summary_path.exists():
                 summary_path.unlink()  # A previous run's summary must not look current.
@@ -1109,18 +1158,15 @@ def _analyze_model(
                 ).append_column(
                     "prompt_token_ids", pa.array(prompt_token_ids, type=pa.list_(pa.int64()))
                 )
+                sample_id_array = output_table["sample_id"]
+                sample_id_type = sample_id_array.type
                 outputs_path = result_dir / "generated_outputs" / f"{language}.parquet"
                 output_writers.setdefault(language, PartitionWriter(outputs_path)).write_table(output_table)
 
-                # A separate teacher-forced forward pass gives each output token its own
-                # contextual hidden state; generation-time step states predict the next token.
-                hidden_states, output_token_ids, offsets, attention = forward_generated_texts_with_context(
-                    loaded,
-                    prompt_token_ids,
-                    generated_ids,
-                    generated_texts,
-                    cfg["runtime"],
+                hidden_states, left_padding = replay_prompt_and_continuation(
+                    loaded, prompt_token_ids, generated_ids, cfg["runtime"]
                 )
+                offsets = align_generated_token_offsets(loaded.tokenizer, generated_ids, generated_texts)
 
                 per_sample_refs: list[list[dict[str, Any]]] = []
                 for sample_idx, text in enumerate(generated_texts):
@@ -1134,11 +1180,11 @@ def _analyze_model(
                         words, tag_status = [], "empty"
 
                     refs: list[dict[str, Any]] = []
-                    for seq_pos, (token_id, span, is_attended) in enumerate(
-                        zip(output_token_ids[sample_idx], offsets[sample_idx], attention[sample_idx])
+                    for seq_pos, (token_id, span) in enumerate(
+                        zip(generated_ids[sample_idx], offsets[sample_idx])
                     ):
                         token_id = int(token_id)
-                        if not is_attended or token_id in special_ids:
+                        if token_id in special_ids:
                             continue
                         start_char, end_char = int(span[0]), int(span[1])
                         if not 0 <= start_char < end_char <= len(text):
@@ -1166,15 +1212,57 @@ def _analyze_model(
                 flat_refs = [ref for refs in per_sample_refs for ref in refs]
                 n_tokens = len(flat_refs)
                 analyzed_token_count += n_tokens
-                n_layers = min(len(hidden_states), len(pcas), len(gmms))
                 token_counts = [len(refs) for refs in per_sample_refs]
                 token_starts = np.cumsum([0, *token_counts])
+                score_positions: dict[tuple[int, int], int] = {}
+                # Consumed references are already unique. Insert them first so
+                # their scores retain the existing order in one contiguous slice.
+                for i, refs in enumerate(per_sample_refs):
+                    continuation_start = left_padding[i] + len(prompt_token_ids[i])
+                    for ref in refs:
+                        score_positions[i, continuation_start + ref["sequence_position"]] = len(score_positions)
+
+                def score_row(sample: int, physical_position: int) -> int:
+                    return score_positions.setdefault((sample, physical_position), len(score_positions))
+
+                prompt_rows = []
+                preceding_rows = []
+                preceding_contexts = []
+                for i, (prompt_ids, continuation_ids, pad, refs) in enumerate(
+                    zip(prompt_token_ids, generated_ids, left_padding, per_sample_refs)
+                ):
+                    for pos, token_id in enumerate(prompt_ids):
+                        if token_id not in special_ids:
+                            prompt_rows.append((i, pos, token_id, score_row(i, pad + pos)))
+                    for ref in refs:
+                        target = ref["sequence_position"]
+                        if target > 0:
+                            context = ("continuation", target - 1, continuation_ids[target - 1])
+                        elif prompt_ids:
+                            context = ("prompt", len(prompt_ids) - 1, prompt_ids[-1])
+                        else:
+                            continue
+                        preceding_rows.append((
+                            i, target, ref["token_id"], score_row(i, pad + len(prompt_ids) + target - 1)
+                        ))
+                        preceding_contexts.append(context)
                 all_posteriors = _batch_posteriors(
                     hidden_states, pcas, gmms,
-                    [ref["sample_index"] for ref in flat_refs],
-                    [ref["sequence_position"] for ref in flat_refs],
+                    [sample for sample, _ in score_positions],
+                    [pos for _, pos in score_positions],
                     posterior_batch_size, len(languages),
                 )
+                del hidden_states
+                n_layers = len(all_posteriors)
+                if prompt_rows and n_layers:
+                    prompt_writer.write_table(_state_posterior_table(
+                        loaded.name, language, sample_id_array, prompt_rows, all_posteriors, posterior_columns
+                    ))
+                if preceding_rows and n_layers:
+                    preceding_writer.write_table(_state_posterior_table(
+                        loaded.name, language, sample_id_array, preceding_rows, all_posteriors,
+                        posterior_columns, preceding_contexts,
+                    ))
                 # These Arrow arrays are built once and reused by every layer table.
                 metadata_table = None
                 pos_groups: dict[tuple[str, str], list[int]] = {}
@@ -1199,7 +1287,7 @@ def _analyze_model(
                 token_tables = []
                 sentence_tables = []
                 for layer in range(n_layers):
-                    values = all_posteriors[layer]
+                    values = all_posteriors[layer, :n_tokens]
                     if metadata_table is not None:
                         table = metadata_table.append_column("layer", pa.array([layer] * n_tokens))
                         for index, column in enumerate(posterior_columns):
@@ -1234,15 +1322,24 @@ def _analyze_model(
                             bucket["sums"][column] += float(value)
 
                 if token_tables:
-                    token_path = result_dir / "token_posteriors" / f"{language}.parquet"
                     token_writers.setdefault(language, PartitionWriter(token_path)).write_table(pa.concat_tables(token_tables))
                 if sentence_tables:
                     sentence_path = result_dir / "sentence_level_posteriors" / f"{language}.parquet"
                     sentence_writers.setdefault(language, PartitionWriter(sentence_path)).write_table(pa.concat_tables(sentence_tables))
-                del hidden_states, per_sample_refs, flat_refs, all_posteriors
+                del per_sample_refs, flat_refs, all_posteriors
                 batches_processed += 1
                 if gc_interval and batches_processed % gc_interval == 0:
                     gc.collect()
+
+            for writer, contexts in ((prompt_writer, None), (preceding_writer, [])):
+                if writer.writer is None:
+                    writer.write_table(_state_posterior_table(
+                        loaded.name, language, pa.array([], type=sample_id_type), [],
+                        np.empty((0, 0, len(posterior_columns)), dtype=np.float32), posterior_columns, contexts,
+                    ), allow_empty=True)
+            if language not in token_writers:
+                # Keep an older continuation file from being paired with the new prompt scores.
+                token_path.unlink(missing_ok=True)
 
             if save_pos_summary:
                 # Small per-POS aggregation: average posterior probability for each candidate
@@ -1269,7 +1366,7 @@ def _analyze_model(
                 tagger.close()
 
     finally:
-        for writers in (token_writers, sentence_writers, output_writers):
+        for writers in (token_writers, sentence_writers, output_writers, prompt_writers, preceding_writers):
             for writer in writers.values():
                 writer.close()
         if tagger is not None:

@@ -31,11 +31,11 @@ complete Aya analysis set
     ↓
 generation (GPU, batch size 1)
     ↓
-full-sequence hidden states on GPU
+one causal replay of the original prompt and generated token IDs
     ↓
-one PCA transform + posterior calculation per layer/batch
+shared PCA projection and language posterior scoring per layer
     ↓
-token + sentence-level outputs
+prompt, consumed-output and preceding-state scores + output sentence summaries
 ```
 
 Wikipedia is used **only** to fit the shared PCA representation. For every configured language, the GMM is trained on the configured Aya subset (up to `data.max_samples_per_language`, currently 2,000 valid rows). The same selected prompts are used for generation; there is no independent Aya train/test split.
@@ -98,7 +98,7 @@ The Aya stage has two passes by design:
 1. **Pass 1:** process the complete Aya input set and fit the final per-language GMMs.
 2. **Pass 2:** process the complete Aya input set again for generation and posterior analysis.
 
-During analysis, each layer/batch performs one PCA transform and one posterior computation. The resulting posterior matrix is reused to produce both token-level and sentence-level outputs.
+During analysis, each layer's PCA and GMM score each selected replay position once. The same scores feed the prompt and continuation views and the consumed-output sentence summaries.
 
 ## Models and languages
 
@@ -256,14 +256,24 @@ outputs/aya_gmms/<model>/metadata.json
 ```text
 outputs/analysis_results/<model>/
     generated_outputs/<language>.parquet
+    prompt_token_posteriors/<language>.parquet
     token_posteriors/<language>.parquet
+    preceding_token_posteriors/<language>.parquet
     sentence_level_posteriors/<language>.parquet
     analysis_counts.csv
 ```
 
 `generated_outputs` records the prompt and continuation IDs used for replay, alongside the decoded text. The continuation includes the sampled stop token when present.
 
+`prompt_token_posteriors` scores the state after consuming each non-special prompt token. `sequence_position` is the zero-based index into the saved `prompt_token_ids`. The saved IDs reflect truncation and any enabled chat template, including its ordinary text tokens. These prompt scores are in-sample under the current Aya GMM fit.
+
 `token_posteriors` scores the contextual state after consuming each non-special generated token. `sequence_position` indexes the original continuation IDs. Character spans and POS tags are aligned separately. Tokens with ambiguous spans or whitespace still have scores and carry a `no_offset` or `unaligned` POS status.
+
+`preceding_token_posteriors` scores the state immediately before each non-special generated token that has a predecessor. Its `sequence_position` and `token_id` identify the generated target. `context_segment`, `context_position`, and `context_token_id` identify the state-bearing token in the saved prompt or continuation IDs. The first generated token uses the final prompt state. Later tokens use the immediately previous continuation position, which can contain a special token.
+
+Join `preceding_token_posteriors` to `token_posteriors` on `model`, `input_language`, `sample_id`, `sequence_position`, and `layer` to attach POS information for the generated target.
+
+Use the prompt and consumed-output scores to compare the same kind of state across phases. The preceding-state scores describe the context available before the model emitted each target. All three views use the same per-layer PCA, fitted language GMMs, and priors. Prompt scoring adds one row per retained prompt token and layer, so it can substantially increase the size of the Parquet outputs.
 
 `sentence_level_posteriors` averages the scores of all retained tokens per Aya sample and layer, including tokens without a POS alignment.
 

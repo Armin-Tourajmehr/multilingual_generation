@@ -73,6 +73,7 @@ class PipelineTests(unittest.TestCase):
             "empty": ("", [], [], []),
             "last": ("Go.", [13, 14], [(0, 2), (2, 3)], [[2., 1.], [1., 2.]]),
         }
+        self.prompt_ids = {"first": [1, 98, 4], "empty": [2], "last": [3, 98]}
 
     def batches(self, cfg, language, batch_size):
         if language != "en":
@@ -83,25 +84,37 @@ class PipelineTests(unittest.TestCase):
 
     def generate(self, loaded, prompts, generation, runtime):
         return ([self.fixtures[p][1] for p in prompts], [self.fixtures[p][0] for p in prompts],
-                1, [[{"first": 1, "empty": 2, "last": 3}[p]] for p in prompts])
+                max(len(self.prompt_ids[p]) for p in prompts), [self.prompt_ids[p] for p in prompts])
 
-    def replay(self, loaded, prompt_ids, generated_ids, texts, runtime):
-        reverse = {value[0]: value for value in self.fixtures.values()}
-        width = max((len(ids) for ids in generated_ids), default=0)
-        hidden = torch.zeros(len(texts), width, 2)
-        for i, text in enumerate(texts):
-            values = reverse[text][3]
+    @staticmethod
+    def prompt_vector(token_id):
+        return [float(token_id % 10) / 2, -float(token_id % 7) / 2]
+
+    def replay(self, loaded, prompt_ids, generated_ids, runtime):
+        continuation_vectors = {tuple(fixture[1]): fixture[3] for fixture in self.fixtures.values()}
+        sequences = [
+            [self.prompt_vector(token_id) for token_id in prompt] + continuation_vectors[tuple(generated)]
+            for prompt, generated in zip(prompt_ids, generated_ids)
+        ]
+        width = max(len(sequence) for sequence in sequences)
+        left_padding = [width - len(sequence) for sequence in sequences]
+        hidden = torch.full((len(sequences), width, 2), 7.0)
+        for i, values in enumerate(sequences):
             if values:
-                hidden[i, :len(values)] = torch.tensor(values)
-        return ([hidden, hidden + 0.25], generated_ids, [reverse[t][2] for t in texts],
-                [[1] * len(ids) for ids in generated_ids])
+                hidden[i, left_padding[i]:] = torch.tensor(values)
+        return [hidden, hidden + 0.25], left_padding
+
+    def offsets(self, tokenizer, generated_ids, texts):
+        by_text = {fixture[0]: fixture[2] for fixture in self.fixtures.values()}
+        return [by_text[text] for text in texts]
 
     def run_analysis(self, cfg=None, directory="results"):
         cfg = cfg or self.cfg
         path = self.root / directory
         with mock.patch.object(pipeline, "iter_aya_batches", side_effect=self.batches), \
                 mock.patch.object(pipeline, "generate_batch", side_effect=self.generate), \
-                mock.patch.object(pipeline, "forward_generated_texts_with_context", side_effect=self.replay), \
+                mock.patch.object(pipeline, "replay_prompt_and_continuation", side_effect=self.replay), \
+                mock.patch.object(pipeline, "align_generated_token_offsets", side_effect=self.offsets), \
                 mock.patch.object(pipeline, "StanzaTagger", FakeTagger), \
                 mock.patch.object(pipeline.gc, "collect") as collect:
             self.analysis_stats = pipeline._analyze_model(cfg, self.loaded, self.pcas, self.gmms, path)
@@ -161,7 +174,7 @@ class PipelineTests(unittest.TestCase):
         self.assert_parquet_matches(path / "sentence_level_posteriors/en.parquet", sentences)
         outputs = [dict(model="fake", sample_id=sid, input_language="en", prompt=prompt,
                         generated_text=self.fixtures[prompt][0], generated_token_count=len(self.fixtures[prompt][1]),
-                        generated_token_ids=self.fixtures[prompt][1], prompt_token_ids=[sid - 100])
+                        generated_token_ids=self.fixtures[prompt][1], prompt_token_ids=self.prompt_ids[prompt])
                    for sid, prompt in zip([101, 102, 103], ["first", "empty", "last"])]
         self.assert_parquet_matches(path / "generated_outputs/en.parquet", outputs)
         self.assertEqual(collections, 0)
@@ -179,6 +192,85 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((first[-1]["char_start"], first[-1]["char_end"]), (0, 0))
         self.assertEqual(self.analysis_stats["generated_tokens"], 8)
         self.assertEqual(self.analysis_stats["analyzed_output_tokens"], 6)
+
+    def test_prompt_and_predecessor_views_score_each_physical_position_once(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["runtime"]["generation_batch_size"] = 3
+        with mock.patch.object(pipeline, "_batch_posteriors", wraps=pipeline._batch_posteriors) as score:
+            path, _ = self.run_analysis(cfg)
+
+        # Joined widths are 9, 1 and 4. The pads are therefore 0, 8 and 5.
+        score.assert_called_once()
+        physical_positions = list(zip(score.call_args.args[3], score.call_args.args[4]))
+        expected = {(0, pos) for pos in (0, 2, 3, 4, 5, 6, 7)} | {(1, 8)} | {(2, pos) for pos in (5, 6, 7, 8)}
+        self.assertCountEqual(physical_positions, expected)
+
+        prompt_table = pq.read_table(path / "prompt_token_posteriors/en.parquet")
+        preceding_table = pq.read_table(path / "preceding_token_posteriors/en.parquet")
+        consumed_table = pq.read_table(path / "token_posteriors/en.parquet")
+
+        def layer_zero(table):
+            return {(row["sample_id"], row["sequence_position"]): row
+                    for row in table.to_pylist() if row["layer"] == 0}
+
+        prompt = layer_zero(prompt_table)
+        preceding = layer_zero(preceding_table)
+        consumed = layer_zero(consumed_table)
+        self.assertEqual({key: row["token_id"] for key, row in prompt.items()},
+                         {(101, 0): 1, (101, 2): 4, (102, 0): 2, (103, 0): 3})
+        self.assertEqual({key: row["token_id"] for key, row in preceding.items()},
+                         {key: row["token_id"] for key, row in consumed.items()})
+        self.assertEqual({key: (row["context_segment"], row["context_position"], row["context_token_id"])
+                          for key, row in preceding.items()}, {
+            (101, 0): ("prompt", 2, 4), (101, 1): ("continuation", 0, 10),
+            (101, 3): ("continuation", 2, 99), (101, 4): ("continuation", 3, 12),
+            (103, 0): ("prompt", 1, 98), (103, 1): ("continuation", 0, 13),
+        })
+        self.assertEqual(preceding[(101, 0)]["P_en"], prompt[(101, 2)]["P_en"])
+        self.assertEqual(preceding[(101, 1)]["P_en"], consumed[(101, 0)]["P_en"])
+
+        for row, vector in (
+            (prompt[(102, 0)], self.prompt_vector(2)),
+            (preceding[(101, 3)], self.fixtures["first"][3][2]),
+            (preceding[(103, 0)], self.prompt_vector(98)),
+            (consumed[(103, 0)], self.fixtures["last"][3][0]),
+        ):
+            expected_p = self.gmms[0].posterior(torch.tensor([vector]))[0].tolist()
+            np.testing.assert_allclose([row["P_en"], row["P_fa"]], expected_p)
+
+        for directory, full in (("prompt_token_posteriors", prompt_table),
+                                ("preceding_token_posteriors", preceding_table)):
+            empty = pq.read_table(path / directory / "fa.parquet")
+            self.assertEqual(empty.num_rows, 0)
+            self.assertTrue(empty.schema.equals(full.schema))
+            self.assertEqual(full.schema.field("P_en").type, pa.float32())
+        self.assertEqual(consumed_table.schema.field("P_en").type, pa.float64())
+
+    def test_first_generated_id_has_no_predecessor_when_prompt_is_empty(self):
+        self.prompt_ids["first"] = []
+        path, _ = self.run_analysis()
+        preceding = pq.read_table(path / "preceding_token_posteriors/en.parquet").to_pylist()
+        first_sample = [row for row in preceding if row["sample_id"] == 101 and row["layer"] == 0]
+        self.assertEqual([row["sequence_position"] for row in first_sample], [1, 3, 4])
+        self.assertEqual(first_sample[0]["context_token_id"], 10)
+        consumed = pq.read_table(path / "token_posteriors/en.parquet").to_pylist()
+        self.assertTrue(any(row["sample_id"] == 101 and row["sequence_position"] == 0 for row in consumed))
+
+    def test_empty_continuation_rerun_does_not_reuse_older_state_rows(self):
+        path, _ = self.run_analysis()
+        token_path = path / "token_posteriors/en.parquet"
+        preceding_path = path / "preceding_token_posteriors/en.parquet"
+        self.assertTrue(token_path.exists())
+        preceding_schema = pq.read_schema(preceding_path)
+
+        self.fixtures["first"] = self.fixtures["last"] = self.fixtures["empty"]
+        self.run_analysis()
+
+        self.assertFalse(token_path.exists())
+        preceding = pq.read_table(preceding_path)
+        self.assertEqual(preceding.num_rows, 0)
+        self.assertTrue(preceding.schema.equals(preceding_schema))
+        self.assertEqual(pq.read_table(path / "prompt_token_posteriors/en.parquet").num_rows, 8)
 
     def test_pos_summary_matches_token_aggregates_and_can_be_disabled(self):
         cfg = copy.deepcopy(self.cfg)

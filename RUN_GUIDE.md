@@ -43,13 +43,15 @@ The smoke test avoids automatic Stanza downloads so it does not unexpectedly dow
 Under `outputs/analysis_results/<model>/`:
 
 - `generated_outputs/<language>.parquet` stores the text and the original `prompt_token_ids` and `generated_token_ids` used for replay.
-- `token_posteriors/<language>.parquet` stores the posterior per non-special output token and layer. `sequence_position` indexes the original generated IDs. POS alignment uses character offsets, with `no_offset` or `unaligned` when a token has no usable word span.
+- `prompt_token_posteriors/<language>.parquet` scores the state after each non-special prompt token and uses positions in the saved prompt IDs.
+- `token_posteriors/<language>.parquet` scores the state after each non-special generated token. `sequence_position` indexes the original generated IDs. POS alignment uses character offsets, with `no_offset` or `unaligned` when a token has no usable word span.
+- `preceding_token_posteriors/<language>.parquet` scores the state just before each generated target with a predecessor. It uses the same generated-token keys as `token_posteriors` and also records the location and ID of the preceding token.
 - `sentence_level_posteriors/<language>.parquet` averages the retained output-token scores per sample and layer, including tokens without POS alignment.
 - `lexical_analysis/pos_posterior_summary/<language>.csv`: mean posterior for each candidate language grouped by layer and POS tag.
 - `manifold/spectral_embedding_coordinates.csv`, per-layer PNGs and `spectral_embedding_all_layers.pdf`: Spectral Embedding of the per-language GMM centroids in PCA space.
 - `analysis_counts.csv`: processed Aya row counts.
 
-The manifold contains one point per language per layer (GMM centroids); it is not an individual-token scatter plot. The token-level file is the source for within-language and POS-level analyses.
+Compare the prompt and consumed-output files for the encoding versus generation analysis. Use the preceding-state file to study language affinity before the model emits a token. The manifold plots one GMM centroid per language per layer.
 
 ## 6. Rerunning after config changes
 

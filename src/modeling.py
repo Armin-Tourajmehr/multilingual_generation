@@ -320,25 +320,21 @@ def _generate_on_device(
 
 
 @torch.inference_mode()
-def forward_generated_texts_with_context(
+def replay_prompt_and_continuation(
     loaded: LoadedModel,
     prompt_token_ids: list[list[int]],
     generated_ids: list[list[int]],
-    generated_texts: list[str],
     runtime: dict[str, Any],
-) -> tuple[list[torch.Tensor], list[list[int]], list[list[tuple[int, int]]], list[list[int]]]:
-    """Replay original prompt and continuation IDs, then align text offsets separately.
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Return all contextual layers and each joined sequence's left padding.
 
-    The returned hidden states correspond to the positions after consuming each
-    generated token, including special tokens. A token without a reliable text
-    span still has its original position and hidden state.
+    For sample i, continuation token j is consumed at position
+    left_padding[i] + len(prompt_token_ids[i]) + j. Its selection state is at
+    the preceding position when that position belongs to the same sequence.
     """
-    if not (len(prompt_token_ids) == len(generated_ids) == len(generated_texts)):
-        raise ValueError("Prompt IDs, generated IDs and generated texts must have equal batch lengths.")
-
-    output_token_ids = [list(ids) for ids in generated_ids]
-    output_attention = [[1] * len(ids) for ids in output_token_ids]
-    sequences = [list(prompt) + ids for prompt, ids in zip(prompt_token_ids, output_token_ids)]
+    if len(prompt_token_ids) != len(generated_ids):
+        raise ValueError("Prompt IDs and generated IDs must have equal batch lengths.")
+    sequences = [list(prompt) + list(ids) for prompt, ids in zip(prompt_token_ids, generated_ids)]
 
     batch_size = len(sequences)
     max_sequence_len = max((len(seq) for seq in sequences), default=0)
@@ -362,7 +358,30 @@ def forward_generated_texts_with_context(
         "input_ids": ids_tensor.to(loaded.device, non_blocking=True),
         "attention_mask": mask_tensor.to(loaded.device, non_blocking=True),
     }
-    full_hidden_states = _forward_hidden_states(loaded, model_inputs, runtime)
+    return _forward_hidden_states(loaded, model_inputs, runtime), left_padding.tolist()
+
+
+@torch.inference_mode()
+def forward_generated_texts_with_context(
+    loaded: LoadedModel,
+    prompt_token_ids: list[list[int]],
+    generated_ids: list[list[int]],
+    generated_texts: list[str],
+    runtime: dict[str, Any],
+) -> tuple[list[torch.Tensor], list[list[int]], list[list[tuple[int, int]]], list[list[int]]]:
+    """Replay original prompt and continuation IDs, then align text offsets separately.
+
+    The returned hidden states correspond to the positions after consuming each
+    generated token, including special tokens. A token without a reliable text
+    span still has its original position and hidden state.
+    """
+    if not (len(prompt_token_ids) == len(generated_ids) == len(generated_texts)):
+        raise ValueError("Prompt IDs, generated IDs and generated texts must have equal batch lengths.")
+
+    output_token_ids = [list(ids) for ids in generated_ids]
+    output_attention = [[1] * len(ids) for ids in output_token_ids]
+    full_hidden_states, _ = replay_prompt_and_continuation(loaded, prompt_token_ids, output_token_ids, runtime)
+    max_sequence_len = max((len(prompt) + len(ids) for prompt, ids in zip(prompt_token_ids, output_token_ids)), default=0)
 
     max_output_len = max((len(ids) for ids in output_token_ids), default=0)
     output_lengths = torch.tensor([len(ids) for ids in output_token_ids], device=loaded.device)
@@ -379,7 +398,7 @@ def forward_generated_texts_with_context(
         output_hidden.masked_fill_(~valid_output[:, :, None], 0)
         output_hidden_states.append(output_hidden)
 
-    del full_hidden_states, model_inputs, ids_tensor, mask_tensor
+    del full_hidden_states
     output_offsets = align_generated_token_offsets(loaded.tokenizer, output_token_ids, generated_texts)
     return output_hidden_states, output_token_ids, output_offsets, output_attention
 

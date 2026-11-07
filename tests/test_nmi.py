@@ -1,4 +1,4 @@
-"""CPU tests of pooled prompt-token NMI against a reference implementation."""
+"""CPU tests of pooled token NMI against a reference implementation."""
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from sklearn.metrics import normalized_mutual_info_score
 
-from src.affinity import _arithmetic_nmi, summarize_prompt_nmi
+from src.affinity import _arithmetic_nmi, summarize_generated_nmi, summarize_prompt_nmi
 
 
 CANDIDATES = ["fa", "en", "ja"]
@@ -17,37 +17,50 @@ PROMPT_SCHEMA = pa.schema([
     ("sequence_position", pa.int64()), ("token_id", pa.int64()), ("layer", pa.int64()),
     ("P_en", pa.float32()), ("P_ja", pa.float32()), ("P_fa", pa.float32()),
 ])
+GENERATED_SCHEMA = pa.schema([
+    *list(PROMPT_SCHEMA)[:-3],
+    ("token", pa.string()), ("upos", pa.string()), ("pos_status", pa.string()),
+    ("char_start", pa.int64()), ("char_end", pa.int64()),
+    ("P_en", pa.float64()), ("P_ja", pa.float64()), ("P_fa", pa.float64()),
+])
 
 
 def one_hot(index):
     return [float(index == column) for column in range(len(CANDIDATES))]
 
 
-class PromptNMITests(unittest.TestCase):
+class TokenNMITests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.model_dir = Path(temp.name)
         self.prompt_dir = self.model_dir / "prompt_token_posteriors"
         self.prompt_dir.mkdir()
+        self.generated_dir = self.model_dir / "token_posteriors"
+        self.generated_dir.mkdir()
 
-    def write_language(self, language, tokens, *, model="demo", input_language=None):
+    def write_language(self, language, tokens, *, model="demo", input_language=None, generated=False):
         rows = []
         for index, (layer, probabilities) in enumerate(tokens):
-            rows.append({
+            row = {
                 "model": model, "sample_id": 41, "input_language": input_language or language,
                 "sequence_position": index, "token_id": 100 + index, "layer": layer,
                 **{f"P_{label}": value for label, value in zip(CANDIDATES, probabilities)},
-            })
-        table = pa.Table.from_pylist(rows, schema=PROMPT_SCHEMA)
-        pq.write_table(table, self.prompt_dir / f"{language}.parquet", row_group_size=2)
+            }
+            if generated:
+                row.update(token="hello", upos="POS_UNAVAILABLE", pos_status="no_offset", char_start=0, char_end=0)
+            rows.append(row)
+        schema, directory = (GENERATED_SCHEMA, self.generated_dir) if generated else (PROMPT_SCHEMA, self.prompt_dir)
+        table = pa.Table.from_pylist(rows, schema=schema)
+        pq.write_table(table, directory / f"{language}.parquet", row_group_size=2)
 
-    def write_complete(self, layers=(1, 2)):
+    def write_complete(self, layers=(1, 2), *, generated=False):
         for index, language in enumerate(CANDIDATES):
-            self.write_language(language, [(layer, one_hot(index)) for layer in layers])
+            self.write_language(language, [(layer, one_hot(index)) for layer in layers], generated=generated)
 
-    def summarize(self, *, candidates=None, batch_size=2):
-        return summarize_prompt_nmi(
+    def summarize(self, *, candidates=None, batch_size=2, generated=False):
+        summarize_nmi = summarize_generated_nmi if generated else summarize_prompt_nmi
+        return summarize_nmi(
             self.model_dir, model="demo", candidates=candidates or CANDIDATES, batch_size=batch_size,
         )
 
@@ -138,6 +151,39 @@ class PromptNMITests(unittest.TestCase):
         pq.write_table(pq.read_table(path).drop(["P_fa"]), path)
         with self.assertRaisesRegex(ValueError, "different candidate pool"):
             self.summarize()
+
+    def test_generated_curve_uses_input_labels_even_without_pos_alignment(self):
+        self.write_complete()
+        for source_index, (language, token_count) in enumerate(zip(CANDIDATES, (3, 2, 4))):
+            tokens = [(1, one_hot(1)), (2, one_hot((source_index + 1) % len(CANDIDATES)))] * token_count
+            self.write_language(language, tokens + [(0, one_hot(source_index))], generated=True)
+        path = self.generated_dir / "ja.parquet"
+        without_pos = pq.read_table(path).drop(["upos", "pos_status", "char_start", "char_end"])
+        pq.write_table(without_pos, path)
+
+        prompt = self.summarize()
+        generated = self.summarize(generated=True, batch_size=1)
+        np.testing.assert_array_equal(generated.layers, [1, 2])
+        np.testing.assert_array_equal(generated.token_counts, [9, 9])
+        np.testing.assert_allclose(prompt.nmi, [1.0, 1.0])
+        # Every token has the same surface text, but its input-language label
+        # varies. A constant predictor and a bijection therefore score 0 and 1.
+        np.testing.assert_allclose(generated.nmi, [0.0, 1.0], atol=1e-12)
+
+    def test_generated_nmi_rejects_missing_and_incomplete_outputs(self):
+        self.write_complete()
+        self.write_complete(generated=True)
+        (self.generated_dir / "en.parquet").unlink()
+        with self.assertRaisesRegex(FileNotFoundError, r"Missing generated posterior files.*en\.parquet"):
+            self.summarize(generated=True)
+
+        self.write_language("en", [(1, one_hot(1))], generated=True)
+        with self.assertRaisesRegex(ValueError, r"en\.parquet has a different transformer layer set \(missing \[2\]"):
+            self.summarize(generated=True)
+
+        self.write_language("en", [], generated=True)
+        with self.assertRaisesRegex(ValueError, r"en\.parquet has no scored transformer-layer generated tokens"):
+            self.summarize(generated=True)
 
 
 if __name__ == "__main__":

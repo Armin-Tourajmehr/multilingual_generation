@@ -293,15 +293,17 @@ Use `--models mgpt` and `--languages en fa` to select pages while keeping the co
 
 ### Layerwise prompt language NMI
 
-Generate an all-languages NMI plot on CPU from the saved `prompt_token_posteriors`.
+Generate an all-languages NMI plot on CPU from the saved `prompt_token_posteriors` and `token_posteriors`.
 
 ```bash
 python scripts/plot_prompt_nmi.py --config configs/b200_config.yaml
 ```
 
-The B200 preset writes `outputs/b200/analysis_results/figures/prompt_language_nmi.pdf` with one curve per enabled model. For each transformer layer, the script assigns each scored prompt token to its highest-posterior language, breaking ties in the configured language order. It pools the assignments and Aya language labels across all configured languages and computes NMI with arithmetic entropy normalization. Layer 0 is the embedding output and is excluded from the plot. The scores are in-sample under the Aya GMM fit.
+The B200 preset writes `outputs/b200/analysis_results/figures/prompt_language_nmi.pdf` with separate prompt-token and generated-token panels and one curve per enabled model in each. For each phase and transformer layer, the script pools all scored tokens across the configured languages. It assigns each token to its highest-posterior language, breaking ties in the configured language order, then computes NMI with arithmetic entropy normalization against the saved `input_language` labels. Both panels exclude the embedding layer.
 
-Every selected model needs scored prompt tokens for every configured language at each plotted layer. Use `--models` to select models and `--results-dir` to point to an archived analysis results directory. Use `--output-dir` to write the PDF elsewhere.
+The generated-token panel measures the association between consumed generation states and the **prompt language**. Both phases use the fitted Aya GMMs, for which the prompt scores are in-sample.
+
+Every selected model needs scored tokens for every configured language at each plotted layer in both panels. Use `--prompt-only` for a prompt-only report, `--models` to select models, and `--results-dir` to point to an archived analysis results directory. Use `--output-dir` to write the PDF elsewhere.
 
 ## Other run metadata
 

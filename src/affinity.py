@@ -210,20 +210,19 @@ def _arithmetic_nmi(contingency: np.ndarray) -> float:
     return float(np.clip(2 * information / entropy_sum, 0.0, 1.0))
 
 
-def summarize_prompt_nmi(
-    model_dir: Path,
+def _summarize_token_nmi(
+    posterior_dir: Path,
     *,
     model: str,
     candidates: list[str],
-    batch_size: int = 65536,
+    batch_size: int,
+    token_kind: str,
 ) -> PromptNMISummary:
-    """Pool one label pair per saved prompt token at each transformer layer."""
     score_columns = _score_columns(candidates, batch_size)
-    prompt_dir = model_dir / "prompt_token_posteriors"
-    paths = [prompt_dir / f"{language}.parquet" for language in candidates]
+    paths = [posterior_dir / f"{language}.parquet" for language in candidates]
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
-        raise FileNotFoundError(f"Missing prompt posterior files for model {model!r}: {', '.join(missing)}")
+        raise FileNotFoundError(f"Missing {token_kind} posterior files for model {model!r}: {', '.join(missing)}")
 
     n_languages = len(candidates)
     contingency_by_layer: dict[int, np.ndarray] = {}
@@ -249,7 +248,7 @@ def summarize_prompt_nmi(
                 contingency_by_layer[layer][source_index] += predicted_counts
 
         if not source_layers:
-            raise ValueError(f"{path} has no scored transformer-layer prompt tokens")
+            raise ValueError(f"{path} has no scored transformer-layer {token_kind} tokens")
         if expected_layers is None:
             if sorted(source_layers) != list(range(1, len(source_layers) + 1)):
                 raise ValueError(f"{path} must have contiguous transformer layers starting at 1 (found {sorted(source_layers)})")
@@ -263,3 +262,31 @@ def summarize_prompt_nmi(
     nmi = np.array([_arithmetic_nmi(contingency_by_layer[layer]) for layer in layers], dtype=np.float64)
     token_counts = np.array([contingency_by_layer[layer].sum() for layer in layers], dtype=np.int64)
     return PromptNMISummary(layers, nmi, token_counts)
+
+
+def summarize_prompt_nmi(
+    model_dir: Path,
+    *,
+    model: str,
+    candidates: list[str],
+    batch_size: int = 65536,
+) -> PromptNMISummary:
+    """Pool one label pair per saved prompt token at each transformer layer."""
+    return _summarize_token_nmi(
+        model_dir / "prompt_token_posteriors", model=model, candidates=candidates,
+        batch_size=batch_size, token_kind="prompt",
+    )
+
+
+def summarize_generated_nmi(
+    model_dir: Path,
+    *,
+    model: str,
+    candidates: list[str],
+    batch_size: int = 65536,
+) -> PromptNMISummary:
+    """Pool generated-token label pairs using each prompt's saved input language."""
+    return _summarize_token_nmi(
+        model_dir / "token_posteriors", model=model, candidates=candidates,
+        batch_size=batch_size, token_kind="generated",
+    )

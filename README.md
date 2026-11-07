@@ -291,6 +291,18 @@ The report averages prompt tokens within each Aya item and layer, then pairs tho
 
 Use `--models mgpt` and `--languages en fa` to select pages while keeping the configured candidate-language pool. For a copy of the run on another machine, use `--results-dir` to point at the directory containing the model folders and `--output-dir` to choose where to write the reports.
 
+### Layerwise prompt language NMI
+
+Generate an all-languages NMI plot on CPU from the saved `prompt_token_posteriors`.
+
+```bash
+python scripts/plot_prompt_nmi.py --config configs/b200_config.yaml
+```
+
+The B200 preset writes `outputs/b200/analysis_results/figures/prompt_language_nmi.pdf` with one curve per enabled model. For each transformer layer, the script assigns each scored prompt token to its highest-posterior language, breaking ties in the configured language order. It pools the assignments and Aya language labels across all configured languages and computes NMI with arithmetic entropy normalization. Layer 0 is the embedding output and is excluded from the plot. The scores are in-sample under the Aya GMM fit.
+
+Every selected model needs scored prompt tokens for every configured language at each plotted layer. Use `--models` to select models and `--results-dir` to point to an archived analysis results directory. Use `--output-dir` to write the PDF elsewhere.
+
 ## Other run metadata
 
 ```text

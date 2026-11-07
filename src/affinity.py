@@ -1,4 +1,4 @@
-"""CPU aggregation of matched prompt and continuation language affinities."""
+"""CPU aggregation of saved language-affinity posteriors."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,6 +20,22 @@ class AffinitySummary:
     continuation: np.ndarray
     difference: np.ndarray
     paired_counts: np.ndarray
+
+
+@dataclass(frozen=True)
+class PromptNMISummary:
+    layers: np.ndarray
+    nmi: np.ndarray
+    token_counts: np.ndarray
+
+
+def _score_columns(candidates: list[str], batch_size: int) -> list[str]:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if (not candidates or any(not isinstance(candidate, str) or not candidate for candidate in candidates)
+            or len(set(candidates)) != len(candidates)):
+        raise ValueError("candidates must contain unique, non-empty language codes")
+    return [f"P_{candidate}" for candidate in candidates]
 
 
 def _partition_batches(
@@ -96,12 +112,7 @@ def summarize_language(
     batch_size: int = 65536,
 ) -> AffinitySummary | None:
     """Give each matched sample/layer pair equal weight in both phases."""
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
-        raise ValueError("batch_size must be a positive integer")
-    if (not candidates or any(not isinstance(candidate, str) or not candidate for candidate in candidates)
-            or len(set(candidates)) != len(candidates)):
-        raise ValueError("candidates must contain unique, non-empty language codes")
-    score_columns = [f"P_{candidate}" for candidate in candidates]
+    score_columns = _score_columns(candidates, batch_size)
     layers: set[int] = set()
     continuations = {}
     seen = set()
@@ -174,3 +185,81 @@ def summarize_language(
     return AffinitySummary(
         source_language, list(candidates), sorted_layers, prompt, continuation, continuation - prompt, paired_counts
     )
+
+
+def _arithmetic_nmi(contingency: np.ndarray) -> float:
+    """Normalize mutual information by the mean of the two label entropies."""
+    total = contingency.sum()
+    if total == 0:
+        return 1.0  # Both label sets are empty, as in scikit-learn's convention.
+
+    source_probs = contingency.sum(axis=1) / total
+    predicted_probs = contingency.sum(axis=0) / total
+    source_present = source_probs[source_probs > 0]
+    predicted_present = predicted_probs[predicted_probs > 0]
+    if len(source_present) == 1 and len(predicted_present) == 1:
+        return 1.0
+    if len(source_present) == 1 or len(predicted_present) == 1:
+        return 0.0
+
+    rows, columns = np.nonzero(contingency)
+    joint_probs = contingency[rows, columns] / total
+    log_ratio = np.log(joint_probs) - np.log(source_probs[rows]) - np.log(predicted_probs[columns])
+    information = np.sum(joint_probs * log_ratio)
+    entropy_sum = -np.dot(source_present, np.log(source_present)) - np.dot(predicted_present, np.log(predicted_present))
+    return float(np.clip(2 * information / entropy_sum, 0.0, 1.0))
+
+
+def summarize_prompt_nmi(
+    model_dir: Path,
+    *,
+    model: str,
+    candidates: list[str],
+    batch_size: int = 65536,
+) -> PromptNMISummary:
+    """Pool one label pair per saved prompt token at each transformer layer."""
+    score_columns = _score_columns(candidates, batch_size)
+    prompt_dir = model_dir / "prompt_token_posteriors"
+    paths = [prompt_dir / f"{language}.parquet" for language in candidates]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing prompt posterior files for model {model!r}: {', '.join(missing)}")
+
+    n_languages = len(candidates)
+    contingency_by_layer: dict[int, np.ndarray] = {}
+    expected_layers: set[int] | None = None
+    for source_index, (language, path) in enumerate(zip(candidates, paths)):
+        source_layers: set[int] = set()
+        for batch in _partition_batches(path, model, language, score_columns, batch_size, continuation=False):
+            scores = _posterior_matrix(batch, score_columns, path)
+            layer_ids = batch.column("layer").to_numpy()
+            transformer_rows = layer_ids > 0
+            if not transformer_rows.any():
+                continue
+
+            # argmax breaks ties in candidate order, independent of the Parquet column order.
+            predictions = scores.argmax(axis=1)[transformer_rows]
+            layers, layer_indices = np.unique(layer_ids[transformer_rows], return_inverse=True)
+            encoded = layer_indices * n_languages + predictions
+            counts = np.bincount(encoded, minlength=len(layers) * n_languages).reshape(-1, n_languages)
+            for layer, predicted_counts in zip(layers.tolist(), counts):
+                source_layers.add(layer)
+                if layer not in contingency_by_layer:
+                    contingency_by_layer[layer] = np.zeros((n_languages, n_languages), dtype=np.int64)
+                contingency_by_layer[layer][source_index] += predicted_counts
+
+        if not source_layers:
+            raise ValueError(f"{path} has no scored transformer-layer prompt tokens")
+        if expected_layers is None:
+            if sorted(source_layers) != list(range(1, len(source_layers) + 1)):
+                raise ValueError(f"{path} must have contiguous transformer layers starting at 1 (found {sorted(source_layers)})")
+            expected_layers = source_layers
+        elif source_layers != expected_layers:
+            missing_layers = sorted(expected_layers - source_layers)
+            extra_layers = sorted(source_layers - expected_layers)
+            raise ValueError(f"{path} has a different transformer layer set (missing {missing_layers}, extra {extra_layers})")
+
+    layers = np.array(sorted(contingency_by_layer), dtype=np.int64)
+    nmi = np.array([_arithmetic_nmi(contingency_by_layer[layer]) for layer in layers], dtype=np.float64)
+    token_counts = np.array([contingency_by_layer[layer].sum() for layer in layers], dtype=np.int64)
+    return PromptNMISummary(layers, nmi, token_counts)

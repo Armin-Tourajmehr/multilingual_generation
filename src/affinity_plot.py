@@ -15,7 +15,7 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator, PercentFormatter, StrM
 import numpy as np
 
 if TYPE_CHECKING:
-    from .affinity import AffinitySummary
+    from .affinity import AffinitySummary, PromptNMISummary
 
 
 def _language_label(code: str, language_names: dict[str, str]) -> str:
@@ -141,4 +141,65 @@ def save_affinity_report(
                         pdf.savefig(fig)
                     finally:
                         plt.close(fig)
+        temporary_path.replace(path)
+
+
+def save_prompt_nmi_plot(path: Path, summaries: dict[str, PromptNMISummary], language_count: int) -> None:
+    """Write one panel of prompt-token NMI curves on their native layer indices."""
+    if not summaries:
+        raise ValueError("A prompt NMI plot needs at least one model summary.")
+    if language_count <= 0:
+        raise ValueError("language_count must be positive.")
+
+    title = "Prompt language NMI across layers"
+    styles = (
+        ("#0072b2", "-", "o"),
+        ("#d55e00", "--", "s"),
+        ("#009e73", "-.", "^"),
+        ("#8a4f88", ":", "D"),
+    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent, prefix=f".{path.stem}.") as directory:
+        temporary_path = Path(directory) / path.name
+        with plt.rc_context({"pdf.fonttype": 42, "font.family": "DejaVu Sans"}):
+            fig, ax = plt.subplots(figsize=(10.2, 6.6))
+            try:
+                fig.subplots_adjust(left=0.105, right=0.966, top=0.80, bottom=0.31)
+                fig.text(0.105, 0.935, title, fontsize=18, weight="bold")
+                fig.text(0.105, 0.886, f"Prompt tokens pooled across all {language_count} languages", fontsize=11, color="#394351")
+
+                last_layer = 1
+                for index, (model, summary) in enumerate(summaries.items()):
+                    layers = summary.layers
+                    last_layer = max(last_layer, int(layers.max()))
+                    color, linestyle, marker = styles[index % len(styles)]
+                    ax.plot(
+                        layers, summary.nmi, label=model, color=color, linestyle=linestyle, marker=marker,
+                        linewidth=1.7, markersize=3.8, markevery=max(1, len(layers) // 10),
+                    )
+
+                tick_stride = max(1, (last_layer + 8) // 9)
+                ax.set_xticks(sorted({1, *range(tick_stride, last_layer + 1, tick_stride), last_layer}))
+                ax.set_xlim(0.75, last_layer + 0.25)
+                ax.set_ylim(0, 1)
+                ax.set_yticks(np.linspace(0, 1, 6))
+                ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.1f}"))
+                ax.set_xlabel("Transformer layer (native index)", fontsize=10)
+                ax.set_ylabel("Normalized mutual information (NMI)", fontsize=10)
+                ax.tick_params(axis="both", labelsize=9, length=3, color="#59636e")
+                ax.set_axisbelow(True)
+                ax.grid(axis="y", color="#e2e7ee", linewidth=0.7)
+                ax.spines[["top", "right"]].set_visible(False)
+                ax.spines[["bottom", "left"]].set_color("#aeb8c4")
+                ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.21), ncols=min(2, len(summaries)), frameon=False, fontsize=9)
+                fig.text(
+                    0.105, 0.083,
+                    "NMI compares the Aya prompt language with each token's argmax posterior language, using arithmetic normalization.",
+                    fontsize=9, color="#394351",
+                )
+                fig.text(0.105, 0.056, "Prompt scores are in-sample for the Aya GMM fit.", fontsize=9, color="#394351")
+                fig.savefig(temporary_path, format="pdf", metadata={"Title": title})
+            finally:
+                plt.close(fig)
         temporary_path.replace(path)

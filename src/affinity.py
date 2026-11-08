@@ -46,8 +46,9 @@ def _partition_batches(
     batch_size: int,
     *,
     continuation: bool,
+    extra_columns: tuple[str, ...] = (),
 ) -> Iterator[pa.RecordBatch]:
-    fields = ["model", "input_language", "sample_id", "layer", *score_columns]
+    fields = ["model", "input_language", "sample_id", "layer", *score_columns, *extra_columns]
     if continuation:
         fields.append("num_output_tokens")
     with pq.ParquetFile(path) as source:

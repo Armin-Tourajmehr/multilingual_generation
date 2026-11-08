@@ -305,6 +305,26 @@ The generated-token panel measures the association between consumed generation s
 
 Every selected model needs scored tokens for every configured language at each plotted layer in both panels. Use `--prompt-only` for a prompt-only report, `--models` to select models, and `--results-dir` to point to an archived analysis results directory. Use `--output-dir` to write the PDF elsewhere.
 
+### GMM confusion, token ratios, and POS
+
+Run the reports on CPU after the experiment completes.
+
+```bash
+python scripts/plot_language_confusion.py --config configs/b200_config.yaml
+python scripts/plot_token_likelihood_ratios.py --config configs/b200_config.yaml
+python scripts/analyze_pos_likelihood_ratios.py --config configs/b200_config.yaml
+```
+
+Reports go under `outputs/b200/analysis_results/<model>/figures/` with the B200 preset.
+
+- `language_confusion.pdf` and `language_confusion.csv` use the highest-posterior component as the predicted language. Matrix rows are source prompt languages, and columns are predicted components. The PDF shows row-normalized matrices pooled across selected layers. The CSV includes counts and row rates per layer and pooled.
+- `token_likelihood_ratios.pdf`, `token_likelihood_ratios.csv`, and `token_likelihood_histogram.csv` use the paper's ratio \(P(A\mid h)/P(B\mid h)\) for each scored token and every candidate \(B\ne A\). The report shows the layerwise shares below, at, and above 1 and the pooled histogram below 1. It counts \(0/0\) as undefined and excludes those pairs from the fractions. Positive numerators over zero denominators contribute to the above-1 category.
+- `pos_likelihood_ratios.pdf` and `pos_likelihood_ratios.csv` report which UPOS tags make up the below-threshold pairs and what fraction of each tag's pairs fall below the threshold. The thresholds are 0.1, 0.2, 0.3, 0.4, 0.5, and 1.0. The report uses aligned UPOS tags from generated tokens. `pos_likelihood_coverage.csv` records usable and excluded rows by prompt language. If you deferred POS tagging, run `python scripts/annotate_outputs.py --config configs/b200_config.yaml` first.
+
+The confusion and ratio reports include both prompt and generated tokens by default. Use `--phase prompt` or `--phase generated` to select one. Each report accepts `--models`, `--layers`, `--results-dir`, and `--output-dir`. For example, `--models mgpt --layers $(seq 3 14)` selects the mGPT layer range used for the paper's confusion matrix. All reports pool the configured test languages and use transformer layers starting at 1.
+
+The reference language \(A\) is the saved `input_language` in both phases. The ratios use the saved posteriors, which include the fitted language priors. Prompt scores are in-sample under the Aya GMM fit. The saved POS tags are produced with Stanza configured for the prompt language. These reports count model-token observations, while the paper averaged subtoken hidden states to obtain word representations before scoring. [Shani and Basirat, Sections 4.3 and 5](https://aclanthology.org/2025.blackboxnlp-1.7.pdf)
+
 ## Other run metadata
 
 ```text

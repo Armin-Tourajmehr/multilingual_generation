@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from time import monotonic, sleep
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,6 +47,23 @@ class FakeTagger:
 
     def close(self):
         self.closed += 1
+
+
+class RendezvousTagger(FakeTagger):
+    """Make fr finish first and keep en running until the parent reports it."""
+
+    def tag_text(self, text, language):
+        if not self.calls:
+            rendezvous = Path(self.cfg["stanza_model_dir"]) / "rendezvous"
+            rendezvous.mkdir(parents=True, exist_ok=True)
+            (rendezvous / f"{language}.pid").write_text(str(os.getpid()))
+            marker = rendezvous / ("fr-reported" if language == "en" else "en.pid")
+            deadline = monotonic() + 30.0
+            while not marker.exists():
+                if monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for {marker.name}")
+                sleep(0.01)
+        return super().tag_text(text, language)
 
 
 class PostprocessTests(unittest.TestCase):
@@ -100,6 +118,15 @@ class PostprocessTests(unittest.TestCase):
             ("sample_id", pa.int32()), ("generated_text", pa.string()),
         ])), self.generated_path)
 
+    def write_french_partition(self):
+        token_path = self.token_path.with_name("fr.parquet")
+        generated_path = self.generated_path.with_name("fr.parquet")
+        language_column = self.schema.get_field_index("input_language")
+        french = self.original.set_column(language_column, self.schema.field(language_column), pa.array(["fr"] * 4))
+        pq.write_table(french, token_path)
+        shutil.copyfile(self.generated_path, generated_path)
+        return token_path, generated_path, self.summary_path.with_name("fr.csv")
+
     def assert_nonannotation_equal(self, before, after):
         self.assertTrue(before.schema.equals(after.schema, check_metadata=True))
         self.assertEqual(before.num_rows, after.num_rows)
@@ -138,6 +165,98 @@ class PostprocessTests(unittest.TestCase):
             self.assertEqual(tuple(reader.fieldnames), SUMMARY_COLUMNS)
         self.assertEqual(len(summaries), 4)
         self.assertEqual([float(row["mean_posterior"]) for row in summaries], [0.25, 0.75, 0.25, 0.75])
+        self.assert_no_temporary_files()
+
+    def test_progress_is_live_and_completion_follows_the_file_commit(self):
+        events = []
+        elapsed = 0.0
+        periodic = "[tiny/en] Processed 1/4 token rows."
+        completed = "[tiny/en] Annotated 4 token rows from 2 samples."
+
+        class SlowTagger(FakeTagger):
+            def tag_text(self, text, language):
+                nonlocal elapsed
+                events.append(("tag", language, text))
+                if text == "abc":
+                    elapsed += 11.0
+                return super().tag_text(text, language)
+
+        def record(message):
+            events.append(("progress", message))
+            if message == periodic:
+                self.assertEqual(pq.read_table(self.token_path)["pos_status"].to_pylist(), ["deferred"] * 4)
+                self.assertFalse(self.summary_path.exists())
+            if message == completed:
+                self.assertEqual(pq.read_table(self.token_path)["pos_status"].to_pylist(), ["ok"] * 4)
+                with self.summary_path.open(newline="", encoding="utf-8") as handle:
+                    self.assertEqual(len(list(csv.DictReader(handle))), 4)
+
+        with patch("src.postprocess.monotonic", side_effect=lambda: elapsed):
+            annotate_outputs(self.cfg, batch_size=1, tagger_factory=SlowTagger, progress=record)
+
+        self.assertEqual(events, [
+            ("progress", "[tiny/en] Starting POS annotation of 4 token rows."),
+            ("tag", "en", "abc"),
+            ("progress", periodic),
+            ("tag", "en", "xyz"),
+            ("progress", completed),
+            ("progress", "[tiny/fr] No token file, skipped."),
+        ])
+
+    def test_parallel_partitions_match_sequential_and_report_live_completion(self):
+        french_tokens, _, french_summary = self.write_french_partition()
+        partitions = {"en": (self.token_path, self.summary_path), "fr": (french_tokens, french_summary)}
+        originals = {language: tokens.read_bytes() for language, (tokens, _) in partitions.items()}
+        annotate_outputs(self.cfg, batch_size=1, tagger_factory=FakeTagger)
+        expected = {language: (pq.read_table(tokens), summary.read_bytes())
+                    for language, (tokens, summary) in partitions.items()}
+        for language, (tokens, summary) in partitions.items():
+            tokens.write_bytes(originals[language])
+            summary.unlink()
+
+        rendezvous = self.root / "resources" / "rendezvous"
+        messages = []
+        starts = {language: f"[tiny/{language}] Starting POS annotation of 4 token rows." for language in partitions}
+        completions = {language: f"[tiny/{language}] Annotated 4 token rows from 2 samples." for language in partitions}
+
+        def record(message):
+            messages.append(message)
+            for language, completed in completions.items():
+                if message == completed:
+                    tokens, summary = partitions[language]
+                    expected_tokens, expected_summary = expected[language]
+                    try:
+                        self.assertTrue(pq.read_table(tokens).equals(expected_tokens, check_metadata=True))
+                        self.assertEqual(summary.read_bytes(), expected_summary)
+                    finally:
+                        if language == "fr":
+                            (rendezvous / "fr-reported").touch()
+
+        results = annotate_outputs(
+            self.cfg, workers=2, batch_size=1, tagger_factory=RendezvousTagger, progress=record,
+        )
+
+        self.assertEqual([(result.language, result.num_rows) for result in results], [("en", 4), ("fr", 4)])
+        for language in partitions:
+            self.assertLess(messages.index(starts[language]), messages.index(completions[language]))
+        self.assertLess(messages.index(completions["fr"]), messages.index(completions["en"]))
+        worker_pids = {int((rendezvous / f"{language}.pid").read_text()) for language in partitions}
+        self.assertEqual(len(worker_pids), 2)
+        self.assertNotIn(os.getpid(), worker_pids)
+        self.assert_no_temporary_files()
+
+    def test_parallel_partition_failure_preserves_its_existing_files(self):
+        french_tokens, french_generated, french_summary = self.write_french_partition()
+        before = french_tokens.read_bytes()
+        french_summary.parent.mkdir(parents=True)
+        french_summary.write_bytes(b"existing French summary\n")
+        pq.write_table(pa.table({"sample_id": [1], "generated_text": ["abc"]}), french_generated)
+
+        with self.assertRaisesRegex(ValueError, r"fr\.parquet.*sample_id 2"):
+            annotate_outputs(self.cfg, workers=2, batch_size=1, tagger_factory=FakeTagger)
+
+        self.assertEqual(french_tokens.read_bytes(), before)
+        self.assertEqual(french_summary.read_bytes(), b"existing French summary\n")
         self.assert_no_temporary_files()
 
     def test_rerun_is_idempotent_and_summary_flag_is_honored(self):
@@ -287,6 +406,8 @@ class PostprocessTests(unittest.TestCase):
         self.assertEqual(result.status, "no_token_file")
         with self.assertRaisesRegex(ValueError, "positive integer"):
             annotate_outputs(self.cfg, batch_size=0)
+        with self.assertRaisesRegex(ValueError, "workers must be a positive integer"):
+            annotate_outputs(self.cfg, workers=0)
         with self.assertRaisesRegex(ValueError, "Unknown model"):
             annotate_outputs(self.cfg, models=["unknown"])
 
@@ -299,6 +420,7 @@ class PostprocessTests(unittest.TestCase):
         )
         self.assertIn("--models", result.stdout)
         self.assertIn("--batch-size", result.stdout)
+        self.assertIn("--workers", result.stdout)
 
 
 if __name__ == "__main__":

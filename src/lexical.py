@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import gc
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 
 class StanzaTagger:
     """Load at most one Stanza language pipeline at a time to limit RAM use."""
 
-    def __init__(self, cfg: dict[str, Any]):
+    def __init__(self, cfg: dict[str, Any], *, resource_lock: ContextManager[Any] | None = None):
         self.cfg = cfg
+        self._resource_lock = resource_lock
         self._pipe = None
         self._language: str | None = None
         self._unavailable: set[str] = set()
@@ -49,7 +51,8 @@ class StanzaTagger:
             ),
         }
 
-        return self._stanza.Pipeline(**kwargs)
+        with self._resource_lock if self._resource_lock is not None else nullcontext():
+            return self._stanza.Pipeline(**kwargs)
 
     def _ensure_pipeline(self, language: str):
         if self._language == language and self._pipe is not None:

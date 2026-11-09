@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
+from multiprocessing import get_context
 import os
 from pathlib import Path
 import shutil
 import stat
 import tempfile
+from threading import Thread
+from time import monotonic
 from typing import Any, Callable
 
 import pyarrow as pa
@@ -142,6 +147,7 @@ def annotate_token_file(
     summary_path: str | Path | None = None,
     batch_size: int = 65536,
     tagger_factory: Callable[[dict[str, Any]], Any] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> AnnotationResult:
     """Replace only POS fields after a complete, successful streamed annotation.
 
@@ -175,7 +181,11 @@ def annotate_token_file(
         missing = required.difference(schema.names)
         if missing:
             raise ValueError(f"{token_path} is missing required columns: {sorted(missing)}")
-        texts = _generated_texts(generated_path, batch_size) if source.metadata.num_rows else {}
+        total_rows = source.metadata.num_rows
+        if progress is not None:
+            progress(f"[{model}/{language}] Starting POS annotation of {total_rows:,} token rows.")
+            next_progress = monotonic() + 10
+        texts = _generated_texts(generated_path, batch_size) if total_rows else {}
         token_temp = _temporary_sibling(token_path)
         writer = pq.ParquetWriter(token_temp, schema, compression="zstd")
         factory = tagger_factory if tagger_factory is not None else StanzaTagger
@@ -190,6 +200,12 @@ def annotate_token_file(
                 posterior_values = [batch.column(schema.get_field_index(name)).to_pylist() for name in posterior_columns]
 
             for row_index, (sample_id, start, end) in enumerate(zip(sample_ids, starts, ends)):
+                if progress is not None and row_index % 1024 == 0:
+                    now = monotonic()
+                    if now >= next_progress:
+                        processed = num_rows + row_index
+                        progress(f"[{model}/{language}] Processed {processed:,}/{total_rows:,} token rows.")
+                        next_progress = now + 10
                 if sample_id not in texts:
                     raise ValueError(
                         f"{generated_path} has no generated text for sample_id {sample_id!r} "
@@ -256,16 +272,124 @@ def annotate_token_file(
                     temporary.unlink()
 
 
+def _annotate_partition(
+    task: tuple[Path, str, str],
+    *,
+    languages: list[str],
+    lexical: dict[str, Any],
+    batch_size: int,
+    tagger_factory: Callable[[dict[str, Any]], Any] | None,
+    progress: Callable[[str], None] | None,
+) -> AnnotationResult:
+    model_root, model, language = task
+    summary = None
+    if lexical.get("save_pos_posterior_summary", True):
+        summary = model_root / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
+    result = annotate_token_file(
+        model_root / "token_posteriors" / f"{language}.parquet",
+        model_root / "generated_outputs" / f"{language}.parquet",
+        model=model, language=language, languages=languages, lexical_config=lexical,
+        summary_path=summary, batch_size=batch_size, tagger_factory=tagger_factory, progress=progress,
+    )
+    if progress is not None:
+        if result.status == "no_token_file":
+            progress(f"[{model}/{language}] No token file, skipped.")
+        else:
+            progress(f"[{model}/{language}] Annotated {result.num_rows:,} token rows from {result.num_samples:,} samples.")
+    return result
+
+
+_worker_messages = None
+_stanza_resource_lock = None
+
+
+def _initialize_worker(messages, resource_lock) -> None:
+    global _worker_messages, _stanza_resource_lock
+    _worker_messages = messages
+    _stanza_resource_lock = resource_lock
+    # Stanza imports PyTorch lazily. Keep its math threads and Arrow's pools
+    # small so each partition worker can make progress on its own core.
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    pa.set_cpu_count(1)
+    pa.set_io_thread_count(1)
+
+
+def _worker_tagger(cfg: dict[str, Any]) -> StanzaTagger:
+    return StanzaTagger(cfg, resource_lock=_stanza_resource_lock)
+
+
+def _run_worker(
+    annotate_partition: Callable[..., AnnotationResult], task: tuple[Path, str, str],
+) -> AnnotationResult:
+    return annotate_partition(task, progress=_worker_messages.put if _worker_messages is not None else None)
+
+
+def _forward_progress(messages, progress: Callable[[str], None], errors: list[BaseException]) -> None:
+    for message in iter(messages.get, None):
+        if not errors:
+            try:
+                progress(message)
+            except BaseException as exc:
+                # Keep draining the pipe while the workers finish their current files.
+                errors.append(exc)
+
+
+def _annotate_parallel(
+    tasks: list[tuple[Path, str, str]],
+    annotate_partition: Callable[..., AnnotationResult],
+    workers: int,
+    progress: Callable[[str], None] | None,
+    allow_downloads: bool,
+) -> list[AnnotationResult]:
+    # Spawn fresh processes rather than inheriting Arrow or PyTorch threads.
+    context = get_context("spawn")
+    # Pipeline initialization can download into the shared Stanza cache.
+    resource_lock = context.Lock() if allow_downloads else None
+    messages = context.SimpleQueue() if progress is not None else None
+    progress_errors: list[BaseException] = []
+    forwarder = None
+    results: dict[int, AnnotationResult] = {}
+    if progress is not None:
+        forwarder = Thread(target=_forward_progress, args=(messages, progress, progress_errors))
+        forwarder.start()
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=workers, mp_context=context,
+            initializer=_initialize_worker, initargs=(messages, resource_lock),
+        )
+        try:
+            pending = {executor.submit(_run_worker, annotate_partition, task): i for i, task in enumerate(tasks)}
+            for future in as_completed(pending):
+                if progress_errors:
+                    raise progress_errors[0]
+                results[pending[future]] = future.result()
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+    finally:
+        if forwarder is not None:
+            messages.put(None)
+            forwarder.join()
+            messages.close()
+    if progress_errors:
+        raise progress_errors[0]
+    return [results[index] for index in range(len(tasks))]
+
+
 def annotate_outputs(
     cfg: dict[str, Any],
     *,
     models: list[str] | None = None,
     batch_size: int = 65536,
     tagger_factory: Callable[[dict[str, Any]], Any] | None = None,
+    progress: Callable[[str], None] | None = None,
+    workers: int = 1,
 ) -> list[AnnotationResult]:
-    """Annotate existing configured run outputs without loading a language model."""
+    """Annotate existing outputs, optionally in parallel by model and language."""
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+        raise ValueError("workers must be a positive integer")
     configured = cfg["models"]
     selected = list(models) if models is not None else [name for name, spec in configured.items() if spec.get("enabled", False)]
     unknown = set(selected).difference(configured)
@@ -284,22 +408,14 @@ def annotate_outputs(
         stanza_root = repo_root / stanza_root
     lexical["stanza_model_dir"] = str(stanza_root)
     languages = list(cfg["languages"])
-    results = []
-    for model in selected:
-        model_root = result_root / model
-        for language in languages:
-            summary = None
-            if lexical.get("save_pos_posterior_summary", True):
-                summary = model_root / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
-            results.append(annotate_token_file(
-                model_root / "token_posteriors" / f"{language}.parquet",
-                model_root / "generated_outputs" / f"{language}.parquet",
-                model=model,
-                language=language,
-                languages=languages,
-                lexical_config=lexical,
-                summary_path=summary,
-                batch_size=batch_size,
-                tagger_factory=tagger_factory,
-            ))
-    return results
+    tasks = [(result_root / model, model, language) for model in selected for language in languages]
+    workers = min(workers, len(tasks))
+    if workers > 1 and len(languages) != len(set(languages)):
+        raise ValueError("Languages must be unique for parallel annotation.")
+    annotate_partition = partial(
+        _annotate_partition, languages=languages, lexical=lexical, batch_size=batch_size,
+        tagger_factory=_worker_tagger if workers > 1 and tagger_factory is None else tagger_factory,
+    )
+    if workers <= 1:
+        return [annotate_partition(task, progress=progress) for task in tasks]
+    return _annotate_parallel(tasks, annotate_partition, workers, progress, lexical.get("download_missing_models", False))

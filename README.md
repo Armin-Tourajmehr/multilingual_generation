@@ -170,7 +170,9 @@ POS tagging is deferred in this preset to keep the CPU tagger outside the GPU jo
 python scripts/annotate_outputs.py --config configs/b200_config.yaml
 ```
 
-This annotates existing token Parquet files atomically and creates the usual POS summaries without loading a language model. Posterior columns and row order are preserved. Until this command completes, `pos_status` is `deferred`; POS summaries are intentionally absent. Set `lexical_analysis.deferred: false` for inline tagging, or `lexical_analysis.enabled: false` to omit POS analysis. `save_pos_posterior_summary: false` suppresses summaries in either mode.
+This annotates existing token Parquet files atomically and creates the usual POS summaries without loading a language model. Posterior columns and row order are preserved. The POS fields and summaries become available as each file finishes. Set `lexical_analysis.deferred: false` for inline tagging, or `lexical_analysis.enabled: false` to omit POS analysis. `save_pos_posterior_summary: false` suppresses summaries in either mode.
+
+Use `--workers 6` on a six-CPU allocation to annotate independent model and language files concurrently. Each parallel worker limits OpenMP, MKL, and Arrow to one thread per pool. The command prints progress by model and language as work proceeds. The default is one worker. Each worker has its own Stanza pipeline and Parquet batch, so reduce the worker count or `--batch-size` if memory is tight.
 
 `runtime.posterior_batch_size` controls GPU posterior chunks (B200 preset: 4,096). Output metadata is shared between layers, posterior results cross to CPU once per generation batch, and Parquet is built directly from columns. `gc_collect_every_batches: 0` disables repeated full Python garbage collection inside the generation loop; model cleanup still runs. Positive values collect at the configured batch interval.
 

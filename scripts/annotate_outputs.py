@@ -18,16 +18,18 @@ def main() -> None:
     parser.add_argument("--config", default=str(ROOT / "configs" / "config.yaml"))
     parser.add_argument("--models", nargs="+", help="Configured model keys to annotate; defaults to enabled models.")
     parser.add_argument("--batch-size", type=int, default=65536, help="Maximum token rows read per batch (default: 65536).")
+    parser.add_argument("--workers", type=int, default=1, help="Model/language files to annotate concurrently (default: 1).")
     args = parser.parse_args()
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
     cfg = load_config(args.config)
-    results = annotate_outputs(cfg, models=args.models, batch_size=args.batch_size)
-    for result in results:
-        if result.status == "no_token_file":
-            print(f"[{result.model}/{result.language}] No token file; skipped.", flush=True)
-        else:
-            print(f"[{result.model}/{result.language}] Annotated {result.num_rows:,} token rows from {result.num_samples:,} samples.", flush=True)
+    print(f"Starting CPU POS annotation with up to {args.workers} worker(s).", flush=True)
+    annotate_outputs(
+        cfg, models=args.models, batch_size=args.batch_size, workers=args.workers,
+        progress=lambda message: print(message, flush=True),
+    )
     print("CPU POS annotation completed.")
 
 

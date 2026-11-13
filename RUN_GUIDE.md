@@ -45,7 +45,7 @@ Under `outputs/analysis_results/<model>/`:
 - `generated_outputs/<language>.parquet` stores the text and the original `prompt_token_ids` and `generated_token_ids` used for replay.
 - `prompt_token_posteriors/<language>.parquet` scores the state after each non-special prompt token and uses positions in the saved prompt IDs.
 - `token_posteriors/<language>.parquet` scores the state after each non-special generated token. `sequence_position` indexes the original generated IDs. POS alignment uses character offsets, with `no_offset` or `unaligned` when a token has no usable word span.
-- `preceding_token_posteriors/<language>.parquet` scores the state just before each generated target with a predecessor. It uses the same generated-token keys as `token_posteriors` and also records the location and ID of the preceding token.
+- `preceding_token_posteriors/<language>.parquet` scores the state just before each generated target with a predecessor. It uses the same generated-token keys as `token_posteriors` and also records the location and ID of the preceding token. Set `outputs.save_preceding_token_posteriors: false` to skip this view.
 - `sentence_level_posteriors/<language>.parquet` averages the retained output-token scores per sample and layer, including tokens without POS alignment.
 - `lexical_analysis/pos_posterior_summary/<language>.csv`: mean posterior for each candidate language grouped by layer and POS tag.
 - `manifold/spectral_embedding_coordinates.csv`, per-layer PNGs and `spectral_embedding_all_layers.pdf`: Spectral Embedding of the per-language GMM centroids in PCA space.

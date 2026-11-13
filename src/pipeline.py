@@ -1091,6 +1091,7 @@ def _analyze_model(
     batch_size = int(cfg["runtime"].get("generation_batch_size", 1))
     posterior_batch_size = int(cfg["runtime"].get("posterior_batch_size", 512))
     gc_interval = int(cfg["runtime"].get("gc_collect_every_batches", 0))
+    save_preceding = cfg["outputs"].get("save_preceding_token_posteriors", True)
     batches_processed = 0
     languages = list(cfg["languages"])
     posterior_columns = [f"P_{language}" for language in languages]
@@ -1101,6 +1102,7 @@ def _analyze_model(
     output_writers: dict[str, PartitionWriter] = {}
     prompt_writers: dict[str, PartitionWriter] = {}
     preceding_writers: dict[str, PartitionWriter] = {}
+    preceding_dir = result_dir / "preceding_token_posteriors"
     counts = {lang: 0 for lang in languages}
     generated_token_count = 0
     analyzed_token_count = 0
@@ -1124,9 +1126,11 @@ def _analyze_model(
             prompt_writer = prompt_writers[language] = PartitionWriter(
                 result_dir / "prompt_token_posteriors" / f"{language}.parquet"
             )
-            preceding_writer = preceding_writers[language] = PartitionWriter(
-                result_dir / "preceding_token_posteriors" / f"{language}.parquet"
-            )
+            preceding_writer = None
+            if save_preceding:
+                preceding_writer = preceding_writers[language] = PartitionWriter(
+                    preceding_dir / f"{language}.parquet"
+                )
             token_path = result_dir / "token_posteriors" / f"{language}.parquet"
             sample_id_type = pa.int64()
             summary_path = result_dir / "lexical_analysis" / "pos_posterior_summary" / f"{language}.csv"
@@ -1234,18 +1238,19 @@ def _analyze_model(
                     for pos, token_id in enumerate(prompt_ids):
                         if token_id not in special_ids:
                             prompt_rows.append((i, pos, token_id, score_row(i, pad + pos)))
-                    for ref in refs:
-                        target = ref["sequence_position"]
-                        if target > 0:
-                            context = ("continuation", target - 1, continuation_ids[target - 1])
-                        elif prompt_ids:
-                            context = ("prompt", len(prompt_ids) - 1, prompt_ids[-1])
-                        else:
-                            continue
-                        preceding_rows.append((
-                            i, target, ref["token_id"], score_row(i, pad + len(prompt_ids) + target - 1)
-                        ))
-                        preceding_contexts.append(context)
+                    if preceding_writer is not None:
+                        for ref in refs:
+                            target = ref["sequence_position"]
+                            if target > 0:
+                                context = ("continuation", target - 1, continuation_ids[target - 1])
+                            elif prompt_ids:
+                                context = ("prompt", len(prompt_ids) - 1, prompt_ids[-1])
+                            else:
+                                continue
+                            preceding_rows.append((
+                                i, target, ref["token_id"], score_row(i, pad + len(prompt_ids) + target - 1)
+                            ))
+                            preceding_contexts.append(context)
                 all_posteriors = _batch_posteriors(
                     hidden_states, pcas, gmms,
                     [sample for sample, _ in score_positions],
@@ -1258,7 +1263,7 @@ def _analyze_model(
                     prompt_writer.write_table(_state_posterior_table(
                         loaded.name, language, sample_id_array, prompt_rows, all_posteriors, posterior_columns
                     ))
-                if preceding_rows and n_layers:
+                if preceding_writer is not None and preceding_rows and n_layers:
                     preceding_writer.write_table(_state_posterior_table(
                         loaded.name, language, sample_id_array, preceding_rows, all_posteriors,
                         posterior_columns, preceding_contexts,
@@ -1291,7 +1296,7 @@ def _analyze_model(
                     if metadata_table is not None:
                         table = metadata_table.append_column("layer", pa.array([layer] * n_tokens))
                         for index, column in enumerate(posterior_columns):
-                            table = table.append_column(column, pa.array(values[:, index], type=pa.float64()))
+                            table = table.append_column(column, pa.array(values[:, index], type=pa.float32()))
                         token_tables.append(table)
 
                     # Accumulate in float64, matching the previous Python float sums.
@@ -1332,7 +1337,7 @@ def _analyze_model(
                     gc.collect()
 
             for writer, contexts in ((prompt_writer, None), (preceding_writer, [])):
-                if writer.writer is None:
+                if writer is not None and writer.writer is None:
                     writer.write_table(_state_posterior_table(
                         loaded.name, language, pa.array([], type=sample_id_type), [],
                         np.empty((0, 0, len(posterior_columns)), dtype=np.float32), posterior_columns, contexts,
@@ -1371,6 +1376,11 @@ def _analyze_model(
                 writer.close()
         if tagger is not None:
             tagger.close()
+
+    if not save_preceding:
+        # Do not leave a previous run's predecessor scores alongside the new results.
+        for language in languages:
+            (preceding_dir / f"{language}.parquet").unlink(missing_ok=True)
 
     pd.DataFrame([
         {"language": lang, "num_samples_analyzed": count}

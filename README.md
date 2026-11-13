@@ -275,9 +275,11 @@ outputs/analysis_results/<model>/
 
 Join `preceding_token_posteriors` to `token_posteriors` on `model`, `input_language`, `sample_id`, `sequence_position`, and `layer` to attach POS information for the generated target.
 
+Set `outputs.save_preceding_token_posteriors: false` in your YAML config to skip the preceding-state view. The setting defaults to `true`. All current plots and deferred POS annotation work with the setting disabled. When reusing an output directory with the setting disabled, the run removes old preceding-state files for the model and languages it processes. Use a separate output directory to retain those results.
+
 Use the prompt and consumed-output scores to compare the same kind of state across phases. The preceding-state scores describe the context available before the model emitted each target. All three views use the same per-layer PCA, fitted language GMMs, and priors. Prompt scoring adds one row per retained prompt token and layer, so it can substantially increase the size of the Parquet outputs.
 
-`sentence_level_posteriors` averages the scores of all retained tokens per Aya sample and layer, including tokens without a POS alignment.
+Token-level probability columns use `float32`, the precision used by the GMM. `sentence_level_posteriors` averages the scores of all retained tokens per Aya sample and layer in `float64`, including tokens without a POS alignment. The report and annotation scripts also accept existing files with `float64` token scores.
 
 ### Figure 1 — Prompt and continuation language affinity
 

@@ -47,6 +47,7 @@ class PipelineTests(unittest.TestCase):
                      "sample_id_column": "sample_id", "max_samples_per_language": 2000, "sampling_seed": 42},
             "runtime": {"generation_batch_size": 2, "posterior_batch_size": 1, "max_input_tokens": 512},
             "generation": {"max_new_tokens": 64},
+            "outputs": {},
             "representation": {"pca_dim": 2, "pca_solver": "gpu_covariance", "gmm_reg_covar": 1e-6},
             "wikipedia": {"dataset_name": "unused", "max_samples_per_language": 2, "max_tokens_per_document": 128},
             "lexical_analysis": {"enabled": False},
@@ -154,8 +155,13 @@ class PipelineTests(unittest.TestCase):
                                          for lang in ("en", "fa")}})
         return tokens, sentences
 
-    def assert_parquet_matches(self, path, rows):
+    def assert_parquet_matches(self, path, rows, *, posterior_type=None):
         expected = pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False)
+        if posterior_type is not None:
+            expected = expected.cast(pa.schema([
+                field.with_type(posterior_type) if field.name.startswith("P_") else field
+                for field in expected.schema
+            ]))
         actual = pq.read_table(path)
         self.assertTrue(actual.schema.equals(expected.schema, check_metadata=False))
         self.assertEqual(actual.column_names, expected.column_names)
@@ -170,7 +176,7 @@ class PipelineTests(unittest.TestCase):
     def test_columnar_outputs_preserve_schema_order_values_and_empty_samples(self):
         path, collections = self.run_analysis()
         tokens, sentences = self.expected_rows()
-        self.assert_parquet_matches(path / "token_posteriors/en.parquet", tokens)
+        self.assert_parquet_matches(path / "token_posteriors/en.parquet", tokens, posterior_type=pa.float32())
         self.assert_parquet_matches(path / "sentence_level_posteriors/en.parquet", sentences)
         outputs = [dict(model="fake", sample_id=sid, input_language="en", prompt=prompt,
                         generated_text=self.fixtures[prompt][0], generated_token_count=len(self.fixtures[prompt][1]),
@@ -244,7 +250,28 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(empty.num_rows, 0)
             self.assertTrue(empty.schema.equals(full.schema))
             self.assertEqual(full.schema.field("P_en").type, pa.float32())
-        self.assertEqual(consumed_table.schema.field("P_en").type, pa.float64())
+        self.assertEqual(consumed_table.schema.field("P_en").type, pa.float32())
+
+    def test_disabling_preceding_outputs_skips_predecessor_only_positions(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["runtime"]["generation_batch_size"] = 3
+        path, _ = self.run_analysis(cfg)
+        retained = ("prompt_token_posteriors", "token_posteriors", "sentence_level_posteriors", "generated_outputs")
+        original = {name: pq.read_table(path / name / "en.parquet") for name in retained}
+        preceding_dir = path / "preceding_token_posteriors"
+        self.assertTrue((preceding_dir / "en.parquet").is_file())
+        other_partition = preceding_dir / "es.parquet"
+        other_partition.write_bytes((preceding_dir / "en.parquet").read_bytes())
+
+        cfg["outputs"]["save_preceding_token_posteriors"] = False
+        with mock.patch.object(pipeline, "_batch_posteriors", wraps=pipeline._batch_posteriors) as score:
+            self.run_analysis(cfg)
+        score.assert_called_once()
+        positions = set(zip(score.call_args.args[3], score.call_args.args[4]))
+        self.assertEqual(positions, {(0, pos) for pos in (0, 2, 3, 4, 6, 7)} | {(1, 8), (2, 5), (2, 7), (2, 8)})
+        self.assertCountEqual(list(preceding_dir.iterdir()), [other_partition])
+        for name, table in original.items():
+            self.assertTrue(pq.read_table(path / name / "en.parquet").equals(table), name)
 
     def test_first_generated_id_has_no_predecessor_when_prompt_is_empty(self):
         self.prompt_ids["first"] = []
@@ -277,7 +304,7 @@ class PipelineTests(unittest.TestCase):
         cfg["lexical_analysis"]["enabled"] = True
         path, _ = self.run_analysis(cfg)
         tokens, _ = self.expected_rows(lexical_enabled=True)
-        self.assert_parquet_matches(path / "token_posteriors/en.parquet", tokens)
+        self.assert_parquet_matches(path / "token_posteriors/en.parquet", tokens, posterior_type=pa.float32())
         summary = pd.read_csv(path / "lexical_analysis/pos_posterior_summary/en.csv")
         for row in summary.itertuples(index=False):
             selected = [token for token in tokens if token["layer"] == row.layer and token["upos"] == row.upos
@@ -291,11 +318,15 @@ class PipelineTests(unittest.TestCase):
     def test_deferred_mode_does_not_construct_stanza_or_write_summary(self):
         cfg = copy.deepcopy(self.cfg)
         cfg["lexical_analysis"].update(enabled=True, deferred=True)
+        cfg["outputs"]["save_preceding_token_posteriors"] = False
         # run_analysis patches the tagger class internally; replace its constructor with a failure.
         with mock.patch.object(FakeTagger, "__init__", side_effect=AssertionError("Stanza must be deferred")):
             path, _ = self.run_analysis(cfg)
+        self.assertFalse((path / "preceding_token_posteriors").exists())
         token_path = path / "token_posteriors/en.parquet"
-        rows = pq.read_table(token_path).to_pylist()
+        deferred = pq.read_table(token_path)
+        self.assertEqual(deferred.schema.field("P_en").type, pa.float32())
+        rows = deferred.to_pylist()
         status_by_token = {row["token_id"]: (row["pos_status"], row["upos"]) for row in rows}
         self.assertEqual(status_by_token[10], ("deferred", "POS_UNAVAILABLE"))
         self.assertEqual(status_by_token[11], ("unaligned", "NO_WORD_ALIGNMENT"))
@@ -309,7 +340,9 @@ class PipelineTests(unittest.TestCase):
             lexical_config=cfg["lexical_analysis"], summary_path=summary_path,
             batch_size=2, tagger_factory=FakeTagger,
         )
-        annotated = pq.read_table(token_path).to_pylist()
+        annotated_table = pq.read_table(token_path)
+        self.assertTrue(annotated_table.schema.equals(deferred.schema))
+        annotated = annotated_table.to_pylist()
         annotated_status = {row["token_id"]: (row["pos_status"], row["upos"]) for row in annotated}
         self.assertEqual(annotated_status[10], ("ok", "NOUN"))
         self.assertEqual(annotated_status[11], status_by_token[11])

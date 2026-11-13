@@ -126,6 +126,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if mixed_precision not in {"fp16", "bf16", "none", "off", "false"}:
         raise ConfigError("runtime.mixed_precision must be fp16, bf16, or disabled.")
 
+    if not isinstance(cfg["outputs"].get("save_preceding_token_posteriors", True), bool):
+        raise ConfigError("outputs.save_preceding_token_posteriors must be true or false.")
+
     lexical = cfg.get("lexical_analysis", {})
     if not isinstance(lexical.get("enabled", True), bool):
         raise ConfigError("lexical_analysis.enabled must be true or false.")

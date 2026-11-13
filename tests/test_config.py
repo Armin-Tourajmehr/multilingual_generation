@@ -53,6 +53,7 @@ class ConfigurationTests(unittest.TestCase):
         baseline = load_config(ROOT / "configs/config.yaml")
         for section, field in (("lexical_analysis", "deferred"),
                                ("lexical_analysis", "save_pos_posterior_summary"),
+                               ("outputs", "save_preceding_token_posteriors"),
                                ("representation", "equal_language_priors")):
             with self.subTest(field=field):
                 cfg = deepcopy(baseline)

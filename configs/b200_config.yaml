@@ -167,3 +167,5 @@ outputs:
   root_dir: outputs/b200
   gmm_dir: aya_gmms
   result_dir: analysis_results
+  # Set to false if you only need the prompt and consumed-generation reports.
+  save_preceding_token_posteriors: true
